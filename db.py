@@ -22,13 +22,16 @@ def _postgres() -> bool:
 
 
 class Row(dict):
-    def __getitem__(self, key):
-        return super().__getitem__(key)
+    pass
 
 
 class Cursor:
     def __init__(self, cursor):
         self._cursor = cursor
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
 
     def fetchone(self):
         row = self._cursor.fetchone()
@@ -45,8 +48,10 @@ class Connection:
         if self.pg:
             import psycopg
             from psycopg.rows import dict_row
-            self.conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+            self._psycopg = psycopg
+            self.conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10)
         else:
+            self._psycopg = None
             self.conn = sqlite3.connect(SQLITE_PATH, timeout=30)
             self.conn.row_factory = sqlite3.Row
             self.conn.execute("PRAGMA foreign_keys=ON")
@@ -55,14 +60,20 @@ class Connection:
     def _sql(self, sql: str) -> str:
         if not self.pg:
             return sql
-        return sql.replace("?", "%s").replace("INSERT OR IGNORE", "INSERT")
+        return sql.replace("?", "%s")
 
     def execute(self, sql: str, params=()):
         if self.pg and "INSERT OR IGNORE" in sql.upper():
             sql = re.sub(r"INSERT\s+OR\s+IGNORE", "INSERT", sql, flags=re.I)
             sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
-        cur = self.conn.execute(self._sql(sql), params)
-        return Cursor(cur)
+        try:
+            cur = self.conn.execute(self._sql(sql), params)
+            return Cursor(cur)
+        except Exception as exc:
+            if self.pg and self._psycopg and isinstance(exc, self._psycopg.IntegrityError):
+                self.conn.rollback()
+                raise sqlite3.IntegrityError(str(exc)) from exc
+            raise
 
     def executescript(self, script: str):
         if not self.pg:
@@ -88,3 +99,7 @@ def connect() -> Connection:
 
 def is_postgres() -> bool:
     return _postgres()
+
+
+def database_name() -> str:
+    return "postgresql" if _postgres() else "sqlite"
