@@ -8,7 +8,7 @@ import secrets
 import time
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -17,6 +17,7 @@ from db import connect
 router = APIRouter()
 CODE_TTL = 90
 SESSION_TTL = max(300, int(os.environ.get("UNG_IAM_SESSION_TTL", "28800")))
+COOKIE_NAME = "ung_iam_session"
 DEFAULT_CLIENTS = {
     "UNG-MDM": ["https://ung-mdm-production.up.railway.app/sso/callback"],
 }
@@ -71,10 +72,15 @@ def ensure_schema() -> None:
 ensure_schema()
 
 
-def identity_from_bearer(authorization: str) -> dict:
-    if not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, "Bearer token required")
-    raw = authorization.split(" ", 1)[1].strip()
+def identity_from_session(authorization: str, request: Request) -> dict:
+    raw = ""
+    if authorization.lower().startswith("bearer "):
+        raw = authorization.split(" ", 1)[1].strip()
+    if not raw:
+        raw = request.cookies.get(COOKIE_NAME, "").strip()
+    if not raw:
+        raise HTTPException(401, "Active UNG-IAM browser session required")
+
     c = connect()
     try:
         row = c.execute(
@@ -134,15 +140,13 @@ def launch(client_id: str, redirect_uri: str, code_challenge: str, state: str):
         "state": state,
     })
     html = f'''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>UNG SSO</title>
-<style>body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f6f8;margin:0;padding:24px;color:#111827}}.card{{max-width:520px;margin:10vh auto;background:white;padding:24px;border-radius:20px;border:1px solid #e5e7eb}}button{{width:100%;padding:14px;border:0;border-radius:12px;background:#101828;color:white;font-weight:750}}p{{color:#667085}}.err{{color:#b42318}}</style></head><body><div class="card"><h2>Continue with UNG Identity</h2><p>This will use your current UNG-IAM session to sign you into {client_id}.</p><button id="go">Continue to {client_id}</button><p id="msg" class="err"></p></div>
+<style>body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f6f8;margin:0;padding:24px;color:#111827}}.card{{max-width:520px;margin:10vh auto;background:white;padding:24px;border-radius:20px;border:1px solid #e5e7eb}}button{{width:100%;padding:14px;border:0;border-radius:12px;background:#101828;color:white;font-weight:750}}p{{color:#667085}}.err{{color:#b42318}}</style></head><body><div class="card"><h2>Continue with UNG Identity</h2><p>This will use your current UNG-IAM browser session to sign you into {client_id}.</p><button id="go">Continue to {client_id}</button><p id="msg" class="err"></p></div>
 <script>
-const token=sessionStorage.getItem('ung_iam_token')||'';
 const q=new URLSearchParams('{safe_query}');
 async function go(){{
- if(!token){{document.getElementById('msg').textContent='No active UNG-IAM browser session. Return to UNG-IAM and sign in first.';return;}}
- const r=await fetch('/v1/sso/code',{{method:'POST',headers:{{'Content-Type':'application/json','Authorization':'Bearer '+token}},body:JSON.stringify(Object.fromEntries(q.entries()))}});
+ const r=await fetch('/v1/sso/code',{{method:'POST',credentials:'same-origin',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(Object.fromEntries(q.entries()))}});
  const d=await r.json();
- if(!r.ok){{document.getElementById('msg').textContent=d.detail||'SSO authorization failed';return;}}
+ if(!r.ok){{document.getElementById('msg').textContent=d.detail||'SSO authorization failed. Return to UNG-IAM and sign in first.';return;}}
  location.href=d.redirect_to;
 }}
 document.getElementById('go').onclick=go;go();
@@ -151,11 +155,11 @@ document.getElementById('go').onclick=go;go();
 
 
 @router.post("/v1/sso/code")
-def issue_code(body: CodeRequest, authorization: str = Header(default="")):
+def issue_code(body: CodeRequest, request: Request, authorization: str = Header(default="")):
     validate_client(body.client_id, body.redirect_uri)
     if len(body.code_challenge) < 40 or len(body.state) < 16:
         raise HTTPException(400, "Invalid PKCE/state parameters")
-    identity = identity_from_bearer(authorization)
+    identity = identity_from_session(authorization, request)
     raw_code = "sso_" + secrets.token_urlsafe(36)
     c = connect()
     try:
