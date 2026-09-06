@@ -3,6 +3,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from main import app as console_app
 from sso_router import router as sso_router
+from janus_router import router as janus_router
 
 COOKIE_NAME = "ung_iam_session"
 COOKIE_MAX_AGE = 28800
@@ -32,4 +33,5 @@ class BrowserSessionCookieMiddleware(BaseHTTPMiddleware):
 app = FastAPI(title="UNG IAM", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(BrowserSessionCookieMiddleware)
 app.include_router(sso_router)
+app.include_router(janus_router)
 app.mount("/", console_app)
