@@ -28,9 +28,45 @@ PERMISSIONS = {
     'vector.inventory.write': 'Manage VECTOR inventory',
     'vector.movements.read': 'Read VECTOR movements',
     'vector.movements.write': 'Create VECTOR movements',
+    'procure.requests.read': 'Read procurement requests',
+    'procure.requests.write': 'Manage procurement requests',
+    'procure.vendors.read': 'Read procurement vendors',
+    'procure.vendors.write': 'Manage procurement vendors',
+    'procure.bids.read': 'Read procurement bids',
+    'procure.bids.write': 'Manage procurement bids',
+    'procure.awards.write': 'Award procurement bids',
+    'procure.orders.read': 'Read procurement purchase orders',
 }
 
 NEXUS_SERVICE_TOKEN = os.environ.get('UNG_NEXUS_SERVICE_TOKEN', '').strip()
+PROCURE_SERVICE_TOKEN = os.environ.get('UNG_PROCURE_SERVICE_TOKEN', '').strip()
+
+
+def _ensure_service_identity(c, *, role_name, role_id, identity_id, display_name, permissions, token, label):
+    role = c.execute('SELECT id FROM roles WHERE name=?', (role_name,)).fetchone()
+    actual_role_id = role['id'] if role else role_id
+    if not role:
+        c.execute(
+            'INSERT INTO roles(id,name,description,created_at) VALUES(?,?,?,?)',
+            (actual_role_id, role_name, f'{display_name} service identity', now()),
+        )
+    for permission in permissions:
+        c.execute('INSERT OR IGNORE INTO role_permissions(role_id,permission_name) VALUES(?,?)', (actual_role_id, permission))
+
+    identity = c.execute('SELECT id FROM identities WHERE id=?', (identity_id,)).fetchone()
+    if not identity:
+        c.execute(
+            'INSERT INTO identities(id,identity_type,access_class,display_name,email,password_hash,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?,1,?,?)',
+            (identity_id, 'service', 'service', display_name, None, None, now(), now()),
+        )
+    c.execute('INSERT OR IGNORE INTO identity_roles(identity_id,role_id) VALUES(?,?)', (identity_id, actual_role_id))
+
+    if token:
+        credential_hash = hash_token(token)
+        c.execute(
+            'INSERT OR IGNORE INTO service_credentials(credential_hash,identity_id,label,expires_at,created_at,last_used_at) VALUES(?,?,?,?,?,NULL)',
+            (credential_hash, identity_id, label, None, now()),
+        )
 
 
 def seed_ecosystem_permissions():
@@ -44,30 +80,28 @@ def seed_ecosystem_permissions():
             for name in PERMISSIONS:
                 c.execute('INSERT OR IGNORE INTO role_permissions(role_id,permission_name) VALUES(?,?)', (admin['id'], name))
 
-        role = c.execute("SELECT id FROM roles WHERE name='nexus-service'").fetchone()
-        role_id = role['id'] if role else 'role-nexus-service'
-        if not role:
-            c.execute(
-                'INSERT INTO roles(id,name,description,created_at) VALUES(?,?,?,?)',
-                (role_id, 'nexus-service', 'UNG-NEXUS integration service identity', now()),
-            )
-        for permission in ('platform:service', 'nexus.endpoints.read', 'nexus.endpoints.write', 'nexus.messages.read', 'nexus.messages.write'):
-            c.execute('INSERT OR IGNORE INTO role_permissions(role_id,permission_name) VALUES(?,?)', (role_id, permission))
+        _ensure_service_identity(
+            c,
+            role_name='nexus-service',
+            role_id='role-nexus-service',
+            identity_id='svc-ung-nexus',
+            display_name='UNG-NEXUS',
+            permissions=('platform:service', 'nexus.endpoints.read', 'nexus.endpoints.write', 'nexus.messages.read', 'nexus.messages.write'),
+            token=NEXUS_SERVICE_TOKEN,
+            label='UNG-NEXUS production integration',
+        )
 
-        identity = c.execute("SELECT id FROM identities WHERE id='svc-ung-nexus'").fetchone()
-        if not identity:
-            c.execute(
-                'INSERT INTO identities(id,identity_type,access_class,display_name,email,password_hash,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?,1,?,?)',
-                ('svc-ung-nexus', 'service', 'service', 'UNG-NEXUS', None, None, now(), now()),
-            )
-        c.execute('INSERT OR IGNORE INTO identity_roles(identity_id,role_id) VALUES(?,?)', ('svc-ung-nexus', role_id))
+        _ensure_service_identity(
+            c,
+            role_name='procure-service',
+            role_id='role-procure-service',
+            identity_id='svc-ung-procure',
+            display_name='UNG-PROCURE',
+            permissions=('nexus.messages.write', 'procure.requests.read', 'procure.orders.read'),
+            token=PROCURE_SERVICE_TOKEN,
+            label='UNG-PROCURE production integration',
+        )
 
-        if NEXUS_SERVICE_TOKEN:
-            credential_hash = hash_token(NEXUS_SERVICE_TOKEN)
-            c.execute(
-                'INSERT OR IGNORE INTO service_credentials(credential_hash,identity_id,label,expires_at,created_at,last_used_at) VALUES(?,?,?,?,?,NULL)',
-                (credential_hash, 'svc-ung-nexus', 'UNG-NEXUS production integration', None, now()),
-            )
         c.commit()
     finally:
         c.close()
