@@ -12,6 +12,13 @@ PERMISSIONS = {
     'apollo.plans.write': 'Manage APOLLO plans',
     'apollo.assessments.read': 'Read APOLLO assessments',
     'apollo.assessments.write': 'Manage APOLLO assessments',
+    'apollo.intelligence.read': 'Read APOLLO intelligence',
+    'apollo.intelligence.write': 'Ingest APOLLO intelligence',
+    'apollo.scenarios.read': 'Read APOLLO scenarios',
+    'apollo.scenarios.write': 'Manage APOLLO scenarios',
+    'apollo.recommendations.read': 'Read APOLLO recommendations',
+    'apollo.recommendations.write': 'Manage APOLLO recommendations',
+    'apollo.briefs.read': 'Read APOLLO decision briefs',
     'aegis.policies.read': 'Read AEGIS protection policies',
     'aegis.policies.write': 'Manage AEGIS protection policies',
     'aegis.evaluate': 'Evaluate AEGIS protection policy decisions',
@@ -37,8 +44,6 @@ def seed_ecosystem_permissions():
             for name in PERMISSIONS:
                 c.execute('INSERT OR IGNORE INTO role_permissions(role_id,permission_name) VALUES(?,?)', (admin['id'], name))
 
-        # Dedicated machine identity for UNG-NEXUS. The raw credential lives only in
-        # Railway environment variables; IAM stores only its SHA-256 hash.
         role = c.execute("SELECT id FROM roles WHERE name='nexus-service'").fetchone()
         role_id = role['id'] if role else 'role-nexus-service'
         if not role:
