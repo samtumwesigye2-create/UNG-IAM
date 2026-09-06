@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py db.py main.py sso_router.py entrypoint.py ./
+COPY app.py db.py main.py sso_router.py janus_router.py entrypoint.py ./
 RUN mkdir -p /app/data
 
 EXPOSE 8000
