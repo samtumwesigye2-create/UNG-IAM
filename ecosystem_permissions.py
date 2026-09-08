@@ -42,6 +42,7 @@ NEXUS_SERVICE_TOKEN = os.environ.get('UNG_NEXUS_SERVICE_TOKEN', '').strip()
 PROCURE_SERVICE_TOKEN = os.environ.get('UNG_PROCURE_SERVICE_TOKEN', '').strip()
 UGASHIP_VECTOR_SERVICE_TOKEN = os.environ.get('UGASHIP_VECTOR_SERVICE_TOKEN', '').strip()
 MERCURY_VECTOR_SERVICE_TOKEN = os.environ.get('MERCURY_VECTOR_SERVICE_TOKEN', '').strip()
+ORACLE_VECTOR_SERVICE_TOKEN = os.environ.get('ORACLE_VECTOR_SERVICE_TOKEN', '').strip()
 
 
 def _ensure_service_identity(c, *, role_name, role_id, identity_id, display_name, permissions, token, label):
@@ -71,5 +72,6 @@ def seed_ecosystem_permissions():
         _ensure_service_identity(c, role_name='procure-service', role_id='role-procure-service', identity_id='svc-ung-procure', display_name='UNG-PROCURE', permissions=('nexus.messages.write','procure.requests.read','procure.orders.read'), token=PROCURE_SERVICE_TOKEN, label='UNG-PROCURE production integration')
         _ensure_service_identity(c, role_name='ugaship-vector-service', role_id='role-ugaship-vector-service', identity_id='svc-ugaship-vector', display_name='UGASHIP VECTOR Bridge', permissions=('platform:service','vector.locations.read','vector.inventory.read','vector.movements.read','vector.movements.write'), token=UGASHIP_VECTOR_SERVICE_TOKEN, label='UGASHIP to UNG-VECTOR production handoff')
         _ensure_service_identity(c, role_name='mercury-vector-service', role_id='role-mercury-vector-service', identity_id='svc-ung-mercury', display_name='UNG-MERCURY', permissions=('platform:service','nexus.messages.write','vector.locations.read','vector.inventory.read','vector.movements.read','vector.movements.write'), token=MERCURY_VECTOR_SERVICE_TOKEN, label='UNG-MERCURY to UNG-VECTOR production handoff')
+        _ensure_service_identity(c, role_name='oracle-vector-read-service', role_id='role-oracle-vector-read-service', identity_id='svc-ung-oracle', display_name='UNG-ORACLE', permissions=('platform:service','vector.locations.read','vector.inventory.read','vector.movements.read'), token=ORACLE_VECTOR_SERVICE_TOKEN, label='UNG-ORACLE read-only VECTOR observation')
         c.commit()
     finally: c.close()
