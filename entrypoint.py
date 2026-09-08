@@ -5,11 +5,13 @@ from main import app as console_app
 from sso_router import router as sso_router
 from janus_router import router as janus_router
 from ecosystem_permissions import seed_ecosystem_permissions
+from scripts.provision_remote_sensor_hub import main as provision_remote_sensor_hub
 
 COOKIE_NAME = "ung_iam_session"
 COOKIE_MAX_AGE = 28800
 
 seed_ecosystem_permissions()
+provision_remote_sensor_hub()
 
 
 class BrowserSessionCookieMiddleware(BaseHTTPMiddleware):
