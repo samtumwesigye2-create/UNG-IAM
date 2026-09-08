@@ -9,8 +9,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py db.py main.py sso_router.py janus_router.py ecosystem_permissions.py entrypoint.py ./
+COPY scripts ./scripts
 RUN mkdir -p /app/data
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn entrypoint:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "python scripts/provision_remote_sensor_hub.py && uvicorn entrypoint:app --host 0.0.0.0 --port ${PORT:-8000}"]
