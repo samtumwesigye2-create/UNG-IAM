@@ -7,7 +7,7 @@ import uuid
 from db import connect
 
 DISPLAY_NAME = "Remote Sensor Hub"
-CREDENTIAL_HASH = "f16939c6b9ad5325589adb18513a94e068833dcb57a1b5dbdeaa7d21f9e52774"
+CREDENTIAL_HASH = "f33984926a838151f47dc611f7fd863dc6f07f5d1165fe401c4067c0e5b665d5"
 LABEL = "Macaly Remote Sensor Hub"
 
 
