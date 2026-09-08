@@ -41,79 +41,35 @@ PERMISSIONS = {
 NEXUS_SERVICE_TOKEN = os.environ.get('UNG_NEXUS_SERVICE_TOKEN', '').strip()
 PROCURE_SERVICE_TOKEN = os.environ.get('UNG_PROCURE_SERVICE_TOKEN', '').strip()
 UGASHIP_VECTOR_SERVICE_TOKEN = os.environ.get('UGASHIP_VECTOR_SERVICE_TOKEN', '').strip()
+MERCURY_VECTOR_SERVICE_TOKEN = os.environ.get('MERCURY_VECTOR_SERVICE_TOKEN', '').strip()
 
 
 def _ensure_service_identity(c, *, role_name, role_id, identity_id, display_name, permissions, token, label):
     role = c.execute('SELECT id FROM roles WHERE name=?', (role_name,)).fetchone()
     actual_role_id = role['id'] if role else role_id
     if not role:
-        c.execute(
-            'INSERT INTO roles(id,name,description,created_at) VALUES(?,?,?,?)',
-            (actual_role_id, role_name, f'{display_name} service identity', now()),
-        )
+        c.execute('INSERT INTO roles(id,name,description,created_at) VALUES(?,?,?,?)',(actual_role_id, role_name, f'{display_name} service identity', now()))
     for permission in permissions:
         c.execute('INSERT OR IGNORE INTO role_permissions(role_id,permission_name) VALUES(?,?)', (actual_role_id, permission))
-
     identity = c.execute('SELECT id FROM identities WHERE id=?', (identity_id,)).fetchone()
     if not identity:
-        c.execute(
-            'INSERT INTO identities(id,identity_type,access_class,display_name,email,password_hash,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?,1,?,?)',
-            (identity_id, 'service', 'service', display_name, None, None, now(), now()),
-        )
+        c.execute('INSERT INTO identities(id,identity_type,access_class,display_name,email,password_hash,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?,1,?,?)',(identity_id, 'service', 'service', display_name, None, None, now(), now()))
     c.execute('INSERT OR IGNORE INTO identity_roles(identity_id,role_id) VALUES(?,?)', (identity_id, actual_role_id))
-
     if token:
         credential_hash = hash_token(token)
-        c.execute(
-            'INSERT OR IGNORE INTO service_credentials(credential_hash,identity_id,label,expires_at,created_at,last_used_at) VALUES(?,?,?,?,?,NULL)',
-            (credential_hash, identity_id, label, None, now()),
-        )
+        c.execute('INSERT OR IGNORE INTO service_credentials(credential_hash,identity_id,label,expires_at,created_at,last_used_at) VALUES(?,?,?,?,?,NULL)',(credential_hash, identity_id, label, None, now()))
 
 
 def seed_ecosystem_permissions():
     c = db()
     try:
-        for name, description in PERMISSIONS.items():
-            c.execute('INSERT OR IGNORE INTO permissions(name,description) VALUES(?,?)', (name, description))
-
+        for name, description in PERMISSIONS.items(): c.execute('INSERT OR IGNORE INTO permissions(name,description) VALUES(?,?)', (name, description))
         admin = c.execute("SELECT id FROM roles WHERE name='platform-admin'").fetchone()
         if admin:
-            for name in PERMISSIONS:
-                c.execute('INSERT OR IGNORE INTO role_permissions(role_id,permission_name) VALUES(?,?)', (admin['id'], name))
-
-        _ensure_service_identity(
-            c,
-            role_name='nexus-service',
-            role_id='role-nexus-service',
-            identity_id='svc-ung-nexus',
-            display_name='UNG-NEXUS',
-            permissions=('platform:service', 'nexus.endpoints.read', 'nexus.endpoints.write', 'nexus.messages.read', 'nexus.messages.write'),
-            token=NEXUS_SERVICE_TOKEN,
-            label='UNG-NEXUS production integration',
-        )
-
-        _ensure_service_identity(
-            c,
-            role_name='procure-service',
-            role_id='role-procure-service',
-            identity_id='svc-ung-procure',
-            display_name='UNG-PROCURE',
-            permissions=('nexus.messages.write', 'procure.requests.read', 'procure.orders.read'),
-            token=PROCURE_SERVICE_TOKEN,
-            label='UNG-PROCURE production integration',
-        )
-
-        _ensure_service_identity(
-            c,
-            role_name='ugaship-vector-service',
-            role_id='role-ugaship-vector-service',
-            identity_id='svc-ugaship-vector',
-            display_name='UGASHIP VECTOR Bridge',
-            permissions=('platform:service', 'vector.locations.read', 'vector.inventory.read', 'vector.movements.read', 'vector.movements.write'),
-            token=UGASHIP_VECTOR_SERVICE_TOKEN,
-            label='UGASHIP to UNG-VECTOR production handoff',
-        )
-
+            for name in PERMISSIONS: c.execute('INSERT OR IGNORE INTO role_permissions(role_id,permission_name) VALUES(?,?)', (admin['id'], name))
+        _ensure_service_identity(c, role_name='nexus-service', role_id='role-nexus-service', identity_id='svc-ung-nexus', display_name='UNG-NEXUS', permissions=('platform:service','nexus.endpoints.read','nexus.endpoints.write','nexus.messages.read','nexus.messages.write'), token=NEXUS_SERVICE_TOKEN, label='UNG-NEXUS production integration')
+        _ensure_service_identity(c, role_name='procure-service', role_id='role-procure-service', identity_id='svc-ung-procure', display_name='UNG-PROCURE', permissions=('nexus.messages.write','procure.requests.read','procure.orders.read'), token=PROCURE_SERVICE_TOKEN, label='UNG-PROCURE production integration')
+        _ensure_service_identity(c, role_name='ugaship-vector-service', role_id='role-ugaship-vector-service', identity_id='svc-ugaship-vector', display_name='UGASHIP VECTOR Bridge', permissions=('platform:service','vector.locations.read','vector.inventory.read','vector.movements.read','vector.movements.write'), token=UGASHIP_VECTOR_SERVICE_TOKEN, label='UGASHIP to UNG-VECTOR production handoff')
+        _ensure_service_identity(c, role_name='mercury-vector-service', role_id='role-mercury-vector-service', identity_id='svc-ung-mercury', display_name='UNG-MERCURY', permissions=('platform:service','nexus.messages.write','vector.locations.read','vector.inventory.read','vector.movements.read','vector.movements.write'), token=MERCURY_VECTOR_SERVICE_TOKEN, label='UNG-MERCURY to UNG-VECTOR production handoff')
         c.commit()
-    finally:
-        c.close()
+    finally: c.close()
