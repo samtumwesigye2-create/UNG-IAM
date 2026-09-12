@@ -39,6 +39,15 @@ PERMISSIONS = {
     'procure.bids.write': 'Manage procurement bids',
     'procure.awards.write': 'Award procurement bids',
     'procure.orders.read': 'Read procurement purchase orders',
+    'procure.orders.write': 'Manage procurement purchase orders',
+    'procure.suppliers.read': 'Read supplier purchasing profiles',
+    'procure.suppliers.write': 'Manage supplier purchasing profiles',
+    'procure.receipts.read': 'Read procurement goods-receipt projections',
+    'procure.invoices.read': 'Read procurement supplier-invoice projections',
+    'procure.match.read': 'Read procurement three-way match results',
+    'procure.match.write': 'Evaluate procurement three-way matches',
+    'procure.config.read': 'Read procurement matching configuration',
+    'procure.config.write': 'Manage procurement matching configuration',
 }
 
 NEXUS_SERVICE_TOKEN = os.environ.get('UNG_NEXUS_SERVICE_TOKEN', '').strip()
