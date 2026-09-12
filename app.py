@@ -253,27 +253,57 @@ def payload(c, row) -> dict:
     }
 
 
+def resolve_principal(raw: str) -> Optional[dict]:
+    """
+    Resolve a bearer token to an identity.
+    Checks both active sessions and valid service credentials.
+    Updates last_used_at on successful service credential use.
+    Returns identity payload with permissions, or None if token is invalid/expired.
+    """
+    token_hash = hash_token(raw)
+    c = db()
+    try:
+        # Check for active session token first
+        session = c.execute(
+            """SELECT i.*, s.expires_at, 'session' AS credential_kind
+               FROM sessions s JOIN identities i ON i.id=s.identity_id
+               WHERE s.token_hash=?""",
+            (token_hash,),
+        ).fetchone()
+        if session and session["expires_at"] > now() and session["is_active"]:
+            c.execute("UPDATE sessions SET last_seen_at=? WHERE token_hash=?", (now(), token_hash))
+            c.commit()
+            return payload(c, session)
+
+        # Check for valid service credential
+        service = c.execute(
+            """SELECT i.*, sc.expires_at, 'service_credential' AS credential_kind
+               FROM service_credentials sc JOIN identities i ON i.id=sc.identity_id
+               WHERE sc.credential_hash=?""",
+            (token_hash,),
+        ).fetchone()
+        if service and service["is_active"] and (service["expires_at"] is None or service["expires_at"] > now()):
+            c.execute("UPDATE service_credentials SET last_used_at=? WHERE credential_hash=?", (now(), token_hash))
+            c.commit()
+            return payload(c, service)
+
+        return None
+    finally:
+        c.close()
+
+
 def current_identity(authorization: str = Header(default="")) -> dict:
+    """
+    Dependency for endpoints requiring authentication.
+    Accepts both session tokens and service credentials.
+    """
     if not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Bearer token required")
     raw = authorization.split(" ", 1)[1].strip()
-    th = hash_token(raw)
-    c = db()
-    row = c.execute(
-        """SELECT i.*,s.expires_at
-           FROM sessions s JOIN identities i ON i.id=s.identity_id
-           WHERE s.token_hash=?""",
-        (th,),
-    ).fetchone()
-    if not row or row["expires_at"] <= now() or not row["is_active"]:
-        c.close()
-        raise HTTPException(401, "Session invalid or expired")
-    c.execute("UPDATE sessions SET last_seen_at=? WHERE token_hash=?", (now(), th))
-    c.commit()
-    result = payload(c, row)
-    c.close()
-    result["_token_hash"] = th
-    return result
+    principal = resolve_principal(raw)
+    if not principal:
+        raise HTTPException(401, "Token invalid or expired")
+    return principal
 
 
 def require(permission: str):
@@ -337,8 +367,10 @@ def login(body: LoginRequest):
 @app.post("/v1/auth/logout")
 def logout(me: dict = Depends(current_identity)):
     c = db()
-    c.execute("DELETE FROM sessions WHERE token_hash=?", (me["_token_hash"],))
-    c.commit()
+    th = hash_token(me["_original_token"]) if "_original_token" in me else None
+    if th:
+        c.execute("DELETE FROM sessions WHERE token_hash=?", (th,))
+        c.commit()
     c.close()
     audit("logout", actor_id=me["id"])
     return {"logged_out": True}
@@ -346,7 +378,7 @@ def logout(me: dict = Depends(current_identity)):
 
 @app.get("/v1/me")
 def me(current: dict = Depends(current_identity)):
-    current.pop("_token_hash", None)
+    current.pop("_original_token", None)
     return current
 
 
@@ -536,3 +568,4 @@ def audit_log(limit: int = 100, admin: dict = Depends(require("iam:audit"))):
     rows = c.execute("SELECT * FROM audit_events ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
     c.close()
     return {"count": len(rows), "results": [dict(r) for r in rows]}
+
