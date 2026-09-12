@@ -48,6 +48,12 @@ PERMISSIONS = {
     'procure.match.write': 'Evaluate procurement three-way matches',
     'procure.config.read': 'Read procurement matching configuration',
     'procure.config.write': 'Manage procurement matching configuration',
+    'midas.ap.read': 'Read MIDAS supplier invoices and AP items',
+    'midas.ap.write': 'Create and manage MIDAS supplier invoices',
+    'midas.accounting.read': 'Read MIDAS accounting documents and trial balance',
+    'midas.accounting.post': 'Post and reverse MIDAS accounting documents',
+    'midas.payments.read': 'Read MIDAS payment lifecycle status',
+    'midas.payments.write': 'Schedule and record MIDAS payments',
 }
 
 NEXUS_SERVICE_TOKEN = os.environ.get('UNG_NEXUS_SERVICE_TOKEN', '').strip()
