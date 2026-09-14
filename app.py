@@ -349,7 +349,34 @@ def login(body: LoginRequest):
     email = body.email.strip().lower()
     c = db()
     row = c.execute("SELECT * FROM identities WHERE email=? AND identity_type='human'", (email,)).fetchone()
-    if not row or not row["is_active"] or not row["password_hash"] or not password_valid(body.password, row["password_hash"]):
+    shared_email = os.getenv("UNG_IAM_SHARED_ADMIN_EMAIL", "").strip().lower()
+    is_shared_admin = bool(shared_email and email == shared_email)
+    if row and not row["is_active"]:
+        c.close()
+        audit("login_failed", detail=email)
+        raise HTTPException(401, "Invalid credentials")
+    if is_shared_admin:
+        from shared_admin import verify_master
+        try:
+            verify_master(os.getenv("UNG_IAM_SHARED_AUTH_URL", ""), body.password)
+            if not row:
+                iid = str(uuid.uuid4())
+                c.execute("INSERT OR IGNORE INTO identities VALUES(?,?,?,?,?,?,1,?,?)",
+                          (iid, "human", "corporate", "UNG Shared Administrator", email,
+                           password_hash(secrets.token_urlsafe(48)), now(), now()))
+                row = c.execute("SELECT * FROM identities WHERE email=? AND identity_type='human'", (email,)).fetchone()
+            if not row or not row["is_active"]:
+                raise HTTPException(401, "Invalid credentials")
+            rid = c.execute("SELECT id FROM roles WHERE name='platform-admin'").fetchone()
+            if not rid:
+                raise HTTPException(503, "Administrator role is not configured")
+            c.execute("INSERT OR IGNORE INTO identity_roles(identity_id,role_id) VALUES(?,?)", (row["id"], rid["id"]))
+        except Exception:
+            c.rollback()
+            c.close()
+            audit("shared_admin_login_failed", detail=email)
+            raise
+    elif not row or not row["password_hash"] or not password_valid(body.password, row["password_hash"]):
         c.close()
         audit("login_failed", detail=email)
         raise HTTPException(401, "Invalid credentials")
