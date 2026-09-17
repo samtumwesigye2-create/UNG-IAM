@@ -1,10 +1,10 @@
-"""One-time production human-login reset helper.
+"""One-time production human-login repair helper.
 
-Runs only when UNG_IAM_RESET_PASSWORD is present. When UNG_IAM_RESET_EMAIL is
-set, that existing human identity is reset directly; otherwise the configured
-bootstrap administrator is used. The identity is re-enabled, platform-admin is
-guaranteed, and only its human sessions are revoked. Service credentials are
-untouched.
+If UNG_IAM_RESET_SOURCE_EMAIL and UNG_IAM_RESET_EMAIL are set, the selected
+human administrator can be renamed without changing its existing password.
+If UNG_IAM_RESET_PASSWORD is also set, its password is reset. The identity is
+re-enabled, platform-admin is guaranteed, and only its human sessions are
+revoked. Service credentials are untouched.
 """
 import hashlib
 import os
@@ -27,24 +27,34 @@ def password_hash(password: str) -> str:
 
 def main() -> None:
     password = os.getenv("UNG_IAM_RESET_PASSWORD", "")
-    explicit_email = os.getenv("UNG_IAM_RESET_EMAIL", "").strip().lower()
+    source_email = os.getenv("UNG_IAM_RESET_SOURCE_EMAIL", "").strip().lower()
+    target_email = os.getenv("UNG_IAM_RESET_EMAIL", "").strip().lower()
     bootstrap_email = os.getenv("UNG_IAM_BOOTSTRAP_EMAIL", "").strip().lower()
-    email = explicit_email or bootstrap_email
-    if not password:
-        print("IAM reset skipped: no one-time reset password configured")
+    source_email = source_email or target_email or bootstrap_email
+    target_email = target_email or source_email
+
+    if not password and source_email == target_email:
+        print("IAM reset skipped: no one-time login repair configured")
         return
-    if not email:
-        raise SystemExit("An IAM reset or bootstrap email is required")
+    if not source_email or not target_email:
+        raise SystemExit("IAM source and target login emails are required")
 
     c = connect()
     try:
-        row = c.execute("SELECT id FROM identities WHERE email=? AND identity_type='human'", (email,)).fetchone()
+        row = c.execute("SELECT id,password_hash FROM identities WHERE email=? AND identity_type='human'", (source_email,)).fetchone()
         if not row:
             raise SystemExit("Requested administrator identity does not exist")
         identity_id = row["id"]
+        conflict = c.execute("SELECT id FROM identities WHERE email=? AND id<>?", (target_email, identity_id)).fetchone()
+        if conflict:
+            raise SystemExit("Requested target login email is already in use")
+
+        new_hash = password_hash(password) if password else row["password_hash"]
+        if not new_hash:
+            raise SystemExit("Selected administrator has no local password to preserve")
         c.execute(
-            "UPDATE identities SET password_hash=?, is_active=1, updated_at=? WHERE id=?",
-            (password_hash(password), time.time(), identity_id),
+            "UPDATE identities SET email=?, password_hash=?, is_active=1, updated_at=? WHERE id=?",
+            (target_email, new_hash, time.time(), identity_id),
         )
         role = c.execute("SELECT id FROM roles WHERE name='platform-admin'").fetchone()
         if not role:
@@ -52,7 +62,7 @@ def main() -> None:
         c.execute("INSERT OR IGNORE INTO identity_roles(identity_id,role_id) VALUES(?,?)", (identity_id, role["id"]))
         c.execute("DELETE FROM sessions WHERE identity_id=?", (identity_id,))
         c.commit()
-        print("IAM administrator login reset; human sessions revoked")
+        print("IAM administrator login repaired; human sessions revoked")
     finally:
         c.close()
 
