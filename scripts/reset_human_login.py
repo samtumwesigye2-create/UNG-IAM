@@ -1,20 +1,18 @@
 """One-time production human-login reset helper.
 
 Runs only when UNG_IAM_RESET_PASSWORD is present. It resets the configured
-bootstrap administrator password, re-enables the identity, guarantees the
-platform-admin role, and revokes only that human identity's sessions. Service
-credentials are deliberately untouched.
+bootstrap administrator password, can assign a new explicit login email,
+re-enables the identity, guarantees platform-admin, and revokes only that
+human identity's sessions. Service credentials are deliberately untouched.
 """
 import hashlib
 import os
-from pathlib import Path
 import secrets
 import sys
 import time
+from pathlib import Path
 
-# Railway invokes this file as /app/scripts/reset_human_login.py, so add the
-# application root explicitly before importing the production DB adapter.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from db import connect
 
 
@@ -28,22 +26,30 @@ def password_hash(password: str) -> str:
 
 def main() -> None:
     password = os.getenv("UNG_IAM_RESET_PASSWORD", "")
-    email = os.getenv("UNG_IAM_BOOTSTRAP_EMAIL", "").strip().lower()
+    current_email = os.getenv("UNG_IAM_BOOTSTRAP_EMAIL", "").strip().lower()
+    new_email = os.getenv("UNG_IAM_RESET_EMAIL", "").strip().lower() or current_email
     if not password:
         print("IAM reset skipped: no one-time reset password configured")
         return
-    if not email:
+    if not current_email:
         raise SystemExit("UNG_IAM_BOOTSTRAP_EMAIL is required for reset")
+    if not new_email:
+        raise SystemExit("A reset login email is required")
 
     c = connect()
     try:
-        row = c.execute("SELECT id FROM identities WHERE email=? AND identity_type='human'", (email,)).fetchone()
+        row = c.execute("SELECT id FROM identities WHERE email=? AND identity_type='human'", (current_email,)).fetchone()
+        if not row and new_email != current_email:
+            row = c.execute("SELECT id FROM identities WHERE email=? AND identity_type='human'", (new_email,)).fetchone()
         if not row:
             raise SystemExit("Configured bootstrap administrator identity does not exist")
         identity_id = row["id"]
+        conflict = c.execute("SELECT id FROM identities WHERE email=? AND id<>?", (new_email, identity_id)).fetchone()
+        if conflict:
+            raise SystemExit("Requested reset login email is already in use")
         c.execute(
-            "UPDATE identities SET password_hash=?, is_active=1, updated_at=? WHERE id=?",
-            (password_hash(password), time.time(), identity_id),
+            "UPDATE identities SET email=?, password_hash=?, is_active=1, updated_at=? WHERE id=?",
+            (new_email, password_hash(password), time.time(), identity_id),
         )
         role = c.execute("SELECT id FROM roles WHERE name='platform-admin'").fetchone()
         if not role:
@@ -51,7 +57,7 @@ def main() -> None:
         c.execute("INSERT OR IGNORE INTO identity_roles(identity_id,role_id) VALUES(?,?)", (identity_id, role["id"]))
         c.execute("DELETE FROM sessions WHERE identity_id=?", (identity_id,))
         c.commit()
-        print("IAM bootstrap administrator password reset; human sessions revoked")
+        print("IAM administrator login reset; human sessions revoked")
     finally:
         c.close()
 
