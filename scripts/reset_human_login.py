@@ -7,9 +7,14 @@ credentials are deliberately untouched.
 """
 import hashlib
 import os
+from pathlib import Path
 import secrets
+import sys
 import time
 
+# Railway invokes this file as /app/scripts/reset_human_login.py, so add the
+# application root explicitly before importing the production DB adapter.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from db import connect
 
 
