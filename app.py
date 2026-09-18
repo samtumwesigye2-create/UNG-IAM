@@ -428,20 +428,23 @@ class RecoveryRedeemRequest(BaseModel):
 def issue_recovery(body: RecoveryIssueRequest):
     """Issue a short-lived single-use code only for the configured recovery identity."""
     email = body.email.strip().lower()
-    eligible = {
-        os.environ.get("UNG_IAM_RESET_EMAIL", "").strip().lower(),
-        os.environ.get("UNG_IAM_RESET_SOURCE_EMAIL", "").strip().lower(),
-        BOOTSTRAP_EMAIL,
-    }
-    eligible.discard("")
-    if email not in eligible:
-        audit("recovery_issue_denied", detail=email)
-        raise HTTPException(403, "Identity is not eligible for administrator recovery")
     c = db()
-    row = c.execute("SELECT * FROM identities WHERE email=? AND identity_type='human'", (email,)).fetchone()
+    row = c.execute("SELECT * FROM identities WHERE email=? AND identity_type='human' AND is_active=1", (email,)).fetchone()
     if not row:
         c.close()
-        raise HTTPException(404, "Recovery identity not found")
+        audit("recovery_issue_denied", detail=email)
+        raise HTTPException(403, "Identity is not eligible for administrator recovery")
+    admin = c.execute(
+        """SELECT 1 FROM identity_roles ir
+           JOIN roles r ON r.id=ir.role_id
+           WHERE ir.identity_id=? AND r.name IN ('platform-admin','security-admin')
+           LIMIT 1""",
+        (row["id"],),
+    ).fetchone()
+    if not admin:
+        c.close()
+        audit("recovery_issue_denied", target_id=row["id"], detail="not_admin")
+        raise HTTPException(403, "Identity is not eligible for administrator recovery")
     code = "-".join([f"{secrets.randbelow(10000):04d}" for _ in range(3)])
     c.execute("DELETE FROM recovery_codes WHERE identity_id=? AND used_at IS NULL", (row["id"],))
     c.execute("INSERT INTO recovery_codes(code_hash,identity_id,expires_at,used_at,created_at) VALUES(?,?,?,NULL,?)",
