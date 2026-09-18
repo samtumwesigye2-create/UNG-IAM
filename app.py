@@ -414,10 +414,42 @@ def health():
             c.close()
 
 
+class RecoveryIssueRequest(BaseModel):
+    email: str
+
+
 class RecoveryRedeemRequest(BaseModel):
     email: str
     code: str
     new_password: str
+
+
+@app.post("/v1/auth/recovery/issue")
+def issue_recovery(body: RecoveryIssueRequest):
+    """Issue a short-lived single-use code only for the configured recovery identity."""
+    email = body.email.strip().lower()
+    eligible = {
+        os.environ.get("UNG_IAM_RESET_EMAIL", "").strip().lower(),
+        os.environ.get("UNG_IAM_RESET_SOURCE_EMAIL", "").strip().lower(),
+        BOOTSTRAP_EMAIL,
+    }
+    eligible.discard("")
+    if email not in eligible:
+        audit("recovery_issue_denied", detail=email)
+        raise HTTPException(403, "Identity is not eligible for administrator recovery")
+    c = db()
+    row = c.execute("SELECT * FROM identities WHERE email=? AND identity_type='human'", (email,)).fetchone()
+    if not row:
+        c.close()
+        raise HTTPException(404, "Recovery identity not found")
+    code = "-".join([f"{secrets.randbelow(10000):04d}" for _ in range(3)])
+    c.execute("DELETE FROM recovery_codes WHERE identity_id=? AND used_at IS NULL", (row["id"],))
+    c.execute("INSERT INTO recovery_codes(code_hash,identity_id,expires_at,used_at,created_at) VALUES(?,?,?,NULL,?)",
+              (hash_token(code), row["id"], now() + 600, now()))
+    c.commit()
+    c.close()
+    audit("recovery_code_issued", actor_id="self-recovery", target_id=row["id"], detail="expires_in=600")
+    return {"email": email, "recovery_code": code, "expires_in": 600, "one_time_display": True}
 
 
 @app.post("/v1/auth/recovery/redeem")
