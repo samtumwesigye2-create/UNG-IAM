@@ -534,7 +534,10 @@ def login(body: LoginRequest):
         c.close()
         audit("login_failed", detail=email)
         raise HTTPException(401, "Invalid credentials")
-    if is_shared_admin:
+    # A locally recovered password takes precedence. Shared-admin verification
+    # remains a fallback for the configured federated administrator.
+    local_password_ok = bool(row and row["password_hash"] and password_valid(body.password, row["password_hash"]))
+    if is_shared_admin and not local_password_ok:
         from shared_admin import verify_master
         try:
             verify_master(os.getenv("UNG_IAM_SHARED_AUTH_URL", ""), body.password)
@@ -555,7 +558,7 @@ def login(body: LoginRequest):
             c.close()
             audit("shared_admin_login_failed", detail=email)
             raise
-    elif not row or not row["password_hash"] or not password_valid(body.password, row["password_hash"]):
+    elif not local_password_ok:
         c.close()
         audit("login_failed", detail=email)
         raise HTTPException(401, "Invalid credentials")
