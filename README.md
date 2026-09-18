@@ -55,3 +55,14 @@ Health endpoint: `GET /health`
 ## Integration architecture
 
 UNG IAM will issue and manage identities while UNG Sentinel remains the security monitoring and protection authority. Applications such as UGAMAP, UGASHIP, WMS400Vector, UGAFORCE-HR, UNG-UAS and future platforms should validate identity/access through IAM integration instead of maintaining independent long-term identity stores.
+
+
+## SCIF step-up MFA
+UNG IAM now provides TOTP-based multi-factor enrollment and explicit step-up authentication for high-assurance applications such as UNG-VAULT Digital SCIF.
+
+- `POST /v1/auth/mfa/enroll` starts TOTP enrollment and returns an `otpauth://` URI.
+- `POST /v1/auth/mfa/confirm` confirms enrollment with a 6-digit code.
+- `POST /v1/auth/step-up` verifies a fresh TOTP code for the current bearer session.
+- `POST /v1/auth/introspect` returns the current principal plus MFA evidence.
+- Step-up evidence includes `mfa=true`, `mfa_time`, `amr`, `acr`, and session `auth_time`.
+- MFA state is session-specific. A new login does not inherit a prior session's step-up.
