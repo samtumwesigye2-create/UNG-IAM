@@ -5,11 +5,13 @@ UNG_IAM_DATABASE_URL. SQLite remains a local-development fallback only.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import os
 import secrets
 import sqlite3
+import struct
 import time
 import uuid
 from typing import Optional
@@ -134,6 +136,17 @@ def init_db():
           detail TEXT,
           created_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS mfa_factors(
+          identity_id TEXT PRIMARY KEY REFERENCES identities(id) ON DELETE CASCADE,
+          secret TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 0,
+          created_at REAL NOT NULL,
+          confirmed_at REAL
+        );
+        CREATE TABLE IF NOT EXISTS session_mfa(
+          token_hash TEXT PRIMARY KEY REFERENCES sessions(token_hash) ON DELETE CASCADE,
+          mfa_time REAL NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_sessions_identity ON sessions(identity_id);
         CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at DESC);
         """
@@ -231,9 +244,30 @@ class RoleCreate(BaseModel):
     permissions: list[str] = []
 
 
+class MfaCodeRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=8)
+
+
 class ServiceCredentialRequest(BaseModel):
     label: str = Field(min_length=2, max_length=120)
     ttl_seconds: Optional[int] = Field(default=None, ge=300, le=31536000)
+
+
+def _totp_code(secret_b32: str, at: Optional[float] = None) -> str:
+    counter = int((at if at is not None else now()) // 30)
+    key = base64.b32decode(secret_b32 + "=" * ((8 - len(secret_b32) % 8) % 8), casefold=True)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return f"{value % 1000000:06d}"
+
+
+def _totp_valid(secret_b32: str, code: str) -> bool:
+    candidate = "".join(ch for ch in str(code) if ch.isdigit())
+    if len(candidate) != 6:
+        return False
+    t = now()
+    return any(hmac.compare_digest(_totp_code(secret_b32, t + step * 30), candidate) for step in (-1, 0, 1))
 
 
 def permissions_for(c, identity_id: str) -> set[str]:
@@ -281,15 +315,28 @@ def resolve_principal(raw: str) -> Optional[dict]:
     try:
         # Check for active session token first
         session = c.execute(
-            """SELECT i.*, s.expires_at, 'session' AS credential_kind
+            """SELECT i.*, s.expires_at, s.created_at AS session_created_at, 'session' AS credential_kind
                FROM sessions s JOIN identities i ON i.id=s.identity_id
                WHERE s.token_hash=?""",
             (token_hash,),
         ).fetchone()
         if session and session["expires_at"] > now() and session["is_active"]:
             c.execute("UPDATE sessions SET last_seen_at=? WHERE token_hash=?", (now(), token_hash))
+            mfa_row = c.execute("SELECT mfa_time FROM session_mfa WHERE token_hash=?", (token_hash,)).fetchone()
             c.commit()
-            return payload(c, session)
+            result = payload(c, session)
+            result["auth_time"] = session["session_created_at"]
+            result["credential_kind"] = "session"
+            if mfa_row:
+                result["mfa"] = True
+                result["mfa_time"] = mfa_row["mfa_time"]
+                result["amr"] = ["pwd", "otp", "mfa"]
+                result["acr"] = "urn:ung:loa:scif-step-up"
+            else:
+                result["mfa"] = False
+                result["amr"] = ["pwd"]
+                result["acr"] = "urn:ung:loa:password"
+            return result
 
         # Check for valid service credential
         service = c.execute(
@@ -446,6 +493,80 @@ def login(body: LoginRequest):
     c.close()
     audit("login_success", actor_id=row["id"])
     return {"access_token": raw, "token_type": "bearer", "expires_in": SESSION_TTL, "identity": who}
+
+
+@app.post("/v1/auth/mfa/enroll")
+def mfa_enroll(me: dict = Depends(current_identity)):
+    if me.get("identity_type") != "human":
+        raise HTTPException(400, "MFA enrollment is for human identities")
+    secret = base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+    c = db()
+    c.execute("DELETE FROM mfa_factors WHERE identity_id=?", (me["id"],))
+    c.execute(
+        "INSERT INTO mfa_factors(identity_id,secret,enabled,created_at,confirmed_at) VALUES(?,?,0,?,NULL)",
+        (me["id"], secret, now()),
+    )
+    c.commit()
+    c.close()
+    issuer = "UNG-IAM"
+    account = me.get("email") or me.get("display_name") or me["id"]
+    audit("mfa_enrollment_started", actor_id=me["id"], target_id=me["id"])
+    return {
+        "secret": secret,
+        "otpauth_uri": f"otpauth://totp/{issuer}:{account}?secret={secret}&issuer={issuer}&algorithm=SHA1&digits=6&period=30",
+        "warning": "The secret is shown for enrollment. Protect it and confirm with a generated code.",
+    }
+
+
+@app.post("/v1/auth/mfa/confirm")
+def mfa_confirm(body: MfaCodeRequest, me: dict = Depends(current_identity)):
+    c = db()
+    row = c.execute("SELECT * FROM mfa_factors WHERE identity_id=?", (me["id"],)).fetchone()
+    if not row or not _totp_valid(row["secret"], body.code):
+        c.close()
+        audit("mfa_enrollment_failed", actor_id=me["id"], target_id=me["id"])
+        raise HTTPException(401, "Invalid MFA code")
+    c.execute("UPDATE mfa_factors SET enabled=1,confirmed_at=? WHERE identity_id=?", (now(), me["id"]))
+    c.commit()
+    c.close()
+    audit("mfa_enabled", actor_id=me["id"], target_id=me["id"])
+    return {"mfa_enabled": True}
+
+
+@app.post("/v1/auth/step-up")
+def mfa_step_up(body: MfaCodeRequest, authorization: str = Header(default="")):
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Bearer token required")
+    raw = authorization.split(" ", 1)[1].strip()
+    principal = resolve_principal(raw)
+    if not principal or principal.get("identity_type") != "human":
+        raise HTTPException(401, "Active human session required")
+    token_hash = hash_token(raw)
+    c = db()
+    session = c.execute("SELECT identity_id FROM sessions WHERE token_hash=? AND expires_at>?", (token_hash, now())).fetchone()
+    factor = c.execute("SELECT * FROM mfa_factors WHERE identity_id=? AND enabled=1", (principal["id"],)).fetchone()
+    if not session or not factor or not _totp_valid(factor["secret"], body.code):
+        c.close()
+        audit("mfa_step_up_failed", actor_id=principal["id"], target_id=principal["id"])
+        raise HTTPException(401, "MFA step-up failed")
+    ts = now()
+    c.execute("DELETE FROM session_mfa WHERE token_hash=?", (token_hash,))
+    c.execute("INSERT INTO session_mfa(token_hash,mfa_time) VALUES(?,?)", (token_hash, ts))
+    c.commit()
+    c.close()
+    audit("mfa_step_up_success", actor_id=principal["id"], target_id=principal["id"])
+    return {"mfa": True, "mfa_time": ts, "amr": ["pwd", "otp", "mfa"]}
+
+
+@app.post("/v1/auth/introspect")
+def introspect(authorization: str = Header(default="")):
+    if not authorization.lower().startswith("bearer "):
+        return {"active": False}
+    raw = authorization.split(" ", 1)[1].strip()
+    principal = resolve_principal(raw)
+    if not principal:
+        return {"active": False}
+    return {"active": True, "principal": principal}
 
 
 @app.post("/v1/auth/logout")
