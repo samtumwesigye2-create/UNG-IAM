@@ -255,6 +255,15 @@ class IdentityUpdate(BaseModel):
     roles: Optional[list[str]] = None
 
 
+class PasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class AdminPasswordResetRequest(BaseModel):
+    new_password: str
+
+
 class RoleCreate(BaseModel):
     name: str = Field(min_length=2, max_length=80)
     description: str = ""
@@ -789,6 +798,48 @@ def create_identity(body: IdentityCreate, admin: dict = Depends(require("iam:wri
         raise HTTPException(409, "Identity email already exists")
     audit("identity_created", admin["id"], iid, body.access_class)
     return result
+
+
+@app.post("/v1/me/password")
+def change_my_password(body: PasswordChangeRequest, principal: dict = Depends(require("iam:read"))):
+    c = db()
+    row = c.execute("SELECT * FROM identities WHERE id=? AND identity_type='human'", (principal["id"],)).fetchone()
+    if not row or not row["password_hash"] or not password_valid(body.current_password, row["password_hash"]):
+        c.close()
+        audit("password_change_failed", actor_id=principal["id"], target_id=principal["id"])
+        raise HTTPException(401, "Current password is incorrect")
+    try:
+        encoded = password_hash(body.new_password)
+    except ValueError as exc:
+        c.close()
+        raise HTTPException(400, str(exc))
+    c.execute("UPDATE identities SET password_hash=?,updated_at=? WHERE id=?", (encoded, now(), row["id"]))
+    c.execute("DELETE FROM sessions WHERE identity_id=?", (row["id"],))
+    c.commit()
+    c.close()
+    audit("password_changed", actor_id=principal["id"], target_id=principal["id"])
+    return {"changed": True, "sessions_revoked": True}
+
+
+@app.post("/v1/identities/{identity_id}/password")
+def admin_reset_password(identity_id: str, body: AdminPasswordResetRequest, admin: dict = Depends(require("iam:write"))):
+    c = db()
+    row = c.execute("SELECT * FROM identities WHERE id=? AND identity_type='human'", (identity_id,)).fetchone()
+    if not row:
+        c.close()
+        raise HTTPException(404, "Human identity not found")
+    try:
+        encoded = password_hash(body.new_password)
+    except ValueError as exc:
+        c.close()
+        raise HTTPException(400, str(exc))
+    c.execute("UPDATE identities SET password_hash=?,is_active=1,updated_at=? WHERE id=?",
+              (encoded, now(), identity_id))
+    c.execute("DELETE FROM sessions WHERE identity_id=?", (identity_id,))
+    c.commit()
+    c.close()
+    audit("administrator_password_reset", actor_id=admin["id"], target_id=identity_id)
+    return {"reset": True, "identity_id": identity_id, "sessions_revoked": True}
 
 
 @app.patch("/v1/identities/{identity_id}")
