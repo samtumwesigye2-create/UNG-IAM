@@ -34,7 +34,12 @@ label{display:block;font-size:13px;font-weight:700;margin:14px 0 7px}.field{widt
     <div class="brand"><div class="mark">IAM</div><div><h1>UNG Identity & Access</h1><p>Corporate administration console</p></div></div>
     <label for="email">Administrator email</label><input id="email" class="field" type="email" autocomplete="username" placeholder="name@organization">
     <label for="password">Password</label><input id="password" class="field" type="password" autocomplete="current-password" placeholder="Enter password">
-    <button id="loginBtn" class="primary wide">Sign in</button><div id="loginError" class="error"></div>
+    <button id="loginBtn" class="primary wide">Sign in</button><button id="recoverBtn" class="secondary wide" style="margin-top:10px">Recover administrator account</button><div id="loginError" class="error"></div>
+    <div id="recoveryBox" class="hidden">
+      <label>Recovery code</label><div class="row"><input id="recoveryCode" class="field" readonly><button id="issueCodeBtn" class="secondary">Issue code</button></div>
+      <label>New password</label><input id="recoveryPassword" class="field" type="password" autocomplete="new-password" placeholder="Minimum 12 characters">
+      <button id="redeemBtn" class="primary wide">Reset password</button>
+    </div>
     <div class="note">Authorized administrators only. Access is logged.</div>
   </div>
 </section>
@@ -69,6 +74,8 @@ label{display:block;font-size:13px;font-weight:700;margin:14px 0 7px}.field{widt
 let token=sessionStorage.getItem('ung_iam_token')||'';let me=null;let roles=[];
 const $=id=>document.getElementById(id);
 async function api(path,opts={}){opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});if(token)opts.headers.Authorization='Bearer '+token;const r=await fetch(path,opts);let data={};try{data=await r.json()}catch(e){}if(!r.ok)throw new Error(data.detail||('Request failed: '+r.status));return data}
+async function startRecovery(){ $('loginError').textContent='';$('recoveryBox').classList.remove('hidden');$('issueCodeBtn').disabled=true;try{const d=await api('/v1/auth/recovery/issue',{method:'POST',body:JSON.stringify({email:$('email').value.trim()})});$('recoveryCode').value=d.recovery_code;$('loginError').textContent='One-time code issued. It expires in 10 minutes.'}catch(e){$('loginError').textContent=e.message}finally{$('issueCodeBtn').disabled=false}}
+async function redeemRecovery(){ $('loginError').textContent='';try{await api('/v1/auth/recovery/redeem',{method:'POST',body:JSON.stringify({email:$('email').value.trim(),code:$('recoveryCode').value.trim(),new_password:$('recoveryPassword').value})});$('password').value=$('recoveryPassword').value;$('recoveryPassword').value='';$('recoveryCode').value='';$('recoveryBox').classList.add('hidden');$('loginError').textContent='Password reset. Sign in with your new password.'}catch(e){$('loginError').textContent=e.message}}
 async function login(){ $('loginError').textContent='';$('loginBtn').disabled=true;try{const d=await api('/v1/auth/login',{method:'POST',body:JSON.stringify({email:$('email').value.trim(),password:$('password').value})});token=d.access_token;sessionStorage.setItem('ung_iam_token',token);me=d.identity;await showApp()}catch(e){$('loginError').textContent=e.message}finally{$('loginBtn').disabled=false}}
 async function showApp(){try{if(!me)me=await api('/v1/me');$('loginView').classList.add('hidden');$('appView').classList.remove('hidden');$('welcome').textContent='Signed in as '+me.display_name+' • '+(me.roles||[]).join(', ');await loadAll()}catch(e){sessionStorage.removeItem('ung_iam_token');token='';$('appView').classList.add('hidden');$('loginView').classList.remove('hidden')}}
 async function logout(){try{await api('/v1/auth/logout',{method:'POST'})}catch(e){}sessionStorage.removeItem('ung_iam_token');token='';me=null;location.reload()}
@@ -81,7 +88,7 @@ function openModal(){$('modalError').textContent='';$('identityModal').classList
 async function createIdentity(){try{const type=$('newType').value;const role=$('newRole').value;const payload={display_name:$('newName').value.trim(),email:$('newEmail').value.trim()||null,password:$('newPassword').value||null,identity_type:type,access_class:$('newClass').value,roles:role?[role]:[]};if(type==='service'){payload.email=null;payload.password=null}await api('/v1/identities',{method:'POST',body:JSON.stringify(payload)});closeModal();$('newName').value='';$('newEmail').value='';$('newPassword').value='';await loadAll()}catch(e){$('modalError').textContent=e.message}}
 function esc(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
 function setTab(name){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));['identities','roles','audit'].forEach(n=>$(n+'Panel').classList.toggle('hidden',n!==name))}
-document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));$('loginBtn').onclick=login;$('logoutBtn').onclick=logout;$('newIdentityBtn').onclick=openModal;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});$('identityModal').addEventListener('click',e=>{if(e.target===$('identityModal'))closeModal()});
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));$('loginBtn').onclick=login;$('recoverBtn').onclick=startRecovery;$('issueCodeBtn').onclick=startRecovery;$('redeemBtn').onclick=redeemRecovery;$('logoutBtn').onclick=logout;$('newIdentityBtn').onclick=openModal;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});$('identityModal').addEventListener('click',e=>{if(e.target===$('identityModal'))closeModal()});
 if(token)showApp();
 </script>
 </body></html>'''
