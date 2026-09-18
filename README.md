@@ -66,3 +66,12 @@ UNG IAM now provides TOTP-based multi-factor enrollment and explicit step-up aut
 - `POST /v1/auth/introspect` returns the current principal plus MFA evidence.
 - Step-up evidence includes `mfa=true`, `mfa_time`, `amr`, `acr`, and session `auth_time`.
 - MFA state is session-specific. A new login does not inherit a prior session's step-up.
+
+
+## Encrypted MFA factor storage
+TOTP seed material used for SCIF step-up is encrypted at rest before being written to the IAM database.
+
+- `UNG_IAM_MFA_KEY_B64` must contain a base64-encoded 32-byte AES key.
+- New MFA factors are stored with AES-256-GCM using a fresh nonce and authenticated context.
+- Legacy plaintext factors remain temporarily readable only for migration and are automatically re-encrypted after the next successful MFA confirmation or step-up.
+- MFA factor encryption is separate from password hashing and bearer-session hashing.
