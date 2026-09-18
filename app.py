@@ -23,6 +23,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from db import connect, database_name, is_postgres
 
 SESSION_TTL = max(300, int(os.environ.get("UNG_IAM_SESSION_TTL", "28800")))
+SCIF_HANDLE_TTL = max(60, min(900, int(os.environ.get("UNG_IAM_SCIF_HANDLE_TTL", "300"))))
 BOOTSTRAP_EMAIL = os.environ.get("UNG_IAM_BOOTSTRAP_EMAIL", "").strip().lower()
 BOOTSTRAP_PASSWORD = os.environ.get("UNG_IAM_BOOTSTRAP_PASSWORD", "")
 MFA_KEY_B64 = os.environ.get("UNG_IAM_MFA_KEY_B64", "").strip()
@@ -155,6 +156,13 @@ def init_db():
         CREATE TABLE IF NOT EXISTS session_mfa(
           token_hash TEXT PRIMARY KEY REFERENCES sessions(token_hash) ON DELETE CASCADE,
           mfa_time REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS scif_handles(
+          handle_hash TEXT PRIMARY KEY,
+          identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+          parent_token_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE,
+          expires_at REAL NOT NULL,
+          created_at REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_identity ON sessions(identity_id);
         CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at DESC);
@@ -393,6 +401,37 @@ def resolve_principal(raw: str) -> Optional[dict]:
             return payload(c, service)
 
         return None
+    finally:
+        c.close()
+
+
+def resolve_scif_handle(raw: str) -> Optional[dict]:
+    token_hash = hash_token(raw)
+    c = db()
+    try:
+        row = c.execute(
+            """SELECT h.identity_id,h.parent_token_hash,h.expires_at,
+                      s.expires_at AS session_expires_at,s.created_at AS session_created_at,
+                      i.*
+               FROM scif_handles h
+               JOIN sessions s ON s.token_hash=h.parent_token_hash
+               JOIN identities i ON i.id=h.identity_id
+               WHERE h.handle_hash=?""",
+            (token_hash,),
+        ).fetchone()
+        if not row or row["expires_at"] <= now() or row["session_expires_at"] <= now() or not row["is_active"]:
+            return None
+        mfa_row = c.execute("SELECT mfa_time FROM session_mfa WHERE token_hash=?", (row["parent_token_hash"],)).fetchone()
+        if not mfa_row:
+            return None
+        result = payload(c, row)
+        result["auth_time"] = row["session_created_at"]
+        result["credential_kind"] = "scif_handle"
+        result["mfa"] = True
+        result["mfa_time"] = mfa_row["mfa_time"]
+        result["amr"] = ["pwd", "otp", "mfa"]
+        result["acr"] = "urn:ung:loa:scif-step-up"
+        return result
     finally:
         c.close()
 
@@ -646,9 +685,42 @@ def introspect(authorization: str = Header(default="")):
         return {"active": False}
     raw = authorization.split(" ", 1)[1].strip()
     principal = resolve_principal(raw)
+    if not principal and raw.startswith("scif_"):
+        principal = resolve_scif_handle(raw)
     if not principal:
         return {"active": False}
     return {"active": True, "principal": principal}
+
+
+@app.post("/v1/auth/scif-handle")
+def issue_scif_handle(authorization: str = Header(default="")):
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Bearer token required")
+    raw = authorization.split(" ", 1)[1].strip()
+    principal = resolve_principal(raw)
+    if not principal or principal.get("identity_type") != "human":
+        raise HTTPException(401, "Active human session required")
+    parent_hash = hash_token(raw)
+    c = db()
+    try:
+        mfa_row = c.execute("SELECT mfa_time FROM session_mfa WHERE token_hash=?", (parent_hash,)).fetchone()
+        if not mfa_row:
+            raise HTTPException(401, "Fresh MFA step-up required")
+        age = now() - float(mfa_row["mfa_time"])
+        if age < 0 or age > 300:
+            raise HTTPException(401, "Fresh MFA step-up required")
+        handle = "scif_" + secrets.token_urlsafe(48)
+        handle_hash = hash_token(handle)
+        c.execute("DELETE FROM scif_handles WHERE parent_token_hash=? OR expires_at<=?", (parent_hash, now()))
+        c.execute(
+            "INSERT INTO scif_handles(handle_hash,identity_id,parent_token_hash,expires_at,created_at) VALUES(?,?,?,?,?)",
+            (handle_hash, principal["id"], parent_hash, now()+SCIF_HANDLE_TTL, now()),
+        )
+        c.commit()
+    finally:
+        c.close()
+    audit("scif_handle_issued", actor_id=principal["id"], target_id=principal["id"])
+    return {"access_token": handle, "token_type": "bearer", "expires_in": SCIF_HANDLE_TTL}
 
 
 @app.post("/v1/auth/logout")
