@@ -18,12 +18,14 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from db import connect, database_name, is_postgres
 
 SESSION_TTL = max(300, int(os.environ.get("UNG_IAM_SESSION_TTL", "28800")))
 BOOTSTRAP_EMAIL = os.environ.get("UNG_IAM_BOOTSTRAP_EMAIL", "").strip().lower()
 BOOTSTRAP_PASSWORD = os.environ.get("UNG_IAM_BOOTSTRAP_PASSWORD", "")
+MFA_KEY_B64 = os.environ.get("UNG_IAM_MFA_KEY_B64", "").strip()
 
 app = FastAPI(
     title="UNG IAM",
@@ -258,6 +260,39 @@ class MfaCodeRequest(BaseModel):
 class ServiceCredentialRequest(BaseModel):
     label: str = Field(min_length=2, max_length=120)
     ttl_seconds: Optional[int] = Field(default=None, ge=300, le=31536000)
+
+
+def _mfa_key() -> bytes:
+    if not MFA_KEY_B64:
+        raise HTTPException(503, "MFA encryption key is not configured")
+    try:
+        key = base64.b64decode(MFA_KEY_B64, validate=True)
+    except Exception as exc:
+        raise HTTPException(503, "MFA encryption key is invalid") from exc
+    if len(key) != 32:
+        raise HTTPException(503, "MFA encryption key must be 32 bytes")
+    return key
+
+
+def _mfa_secret_store(secret_b32: str) -> str:
+    nonce = secrets.token_bytes(12)
+    ciphertext = AESGCM(_mfa_key()).encrypt(nonce, secret_b32.encode("ascii"), b"UNG-IAM-MFA-v1")
+    return "enc:v1:" + base64.b64encode(nonce + ciphertext).decode("ascii")
+
+
+def _mfa_secret_load(stored: str) -> str:
+    if not stored.startswith("enc:v1:"):
+        # Legacy plaintext factor. It is accepted temporarily and is re-encrypted
+        # on the next successful confirmation/step-up.
+        return stored
+    try:
+        raw = base64.b64decode(stored.split(":", 2)[2], validate=True)
+        nonce, ciphertext = raw[:12], raw[12:]
+        return AESGCM(_mfa_key()).decrypt(nonce, ciphertext, b"UNG-IAM-MFA-v1").decode("ascii")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(503, "Stored MFA factor cannot be decrypted") from exc
 
 
 def _totp_code(secret_b32: str, at: Optional[float] = None) -> str:
@@ -544,7 +579,7 @@ def mfa_enroll(me: dict = Depends(current_identity)):
     c.execute("DELETE FROM mfa_factors WHERE identity_id=?", (me["id"],))
     c.execute(
         "INSERT INTO mfa_factors(identity_id,secret,enabled,created_at,confirmed_at) VALUES(?,?,0,?,NULL)",
-        (me["id"], secret, now()),
+        (me["id"], _mfa_secret_store(secret), now()),
     )
     c.commit()
     c.close()
@@ -562,10 +597,12 @@ def mfa_enroll(me: dict = Depends(current_identity)):
 def mfa_confirm(body: MfaCodeRequest, me: dict = Depends(current_identity)):
     c = db()
     row = c.execute("SELECT * FROM mfa_factors WHERE identity_id=?", (me["id"],)).fetchone()
-    if not row or not _totp_valid(row["secret"], body.code):
+    if not row or not _totp_valid(_mfa_secret_load(row["secret"]), body.code):
         c.close()
         audit("mfa_enrollment_failed", actor_id=me["id"], target_id=me["id"])
         raise HTTPException(401, "Invalid MFA code")
+    if not str(row["secret"]).startswith("enc:v1:"):
+        c.execute("UPDATE mfa_factors SET secret=? WHERE identity_id=?", (_mfa_secret_store(_mfa_secret_load(row["secret"])), me["id"]))
     c.execute("UPDATE mfa_factors SET enabled=1,confirmed_at=? WHERE identity_id=?", (now(), me["id"]))
     c.commit()
     c.close()
@@ -585,11 +622,13 @@ def mfa_step_up(body: MfaCodeRequest, authorization: str = Header(default="")):
     c = db()
     session = c.execute("SELECT identity_id FROM sessions WHERE token_hash=? AND expires_at>?", (token_hash, now())).fetchone()
     factor = c.execute("SELECT * FROM mfa_factors WHERE identity_id=? AND enabled=1", (principal["id"],)).fetchone()
-    if not session or not factor or not _totp_valid(factor["secret"], body.code):
+    if not session or not factor or not _totp_valid(_mfa_secret_load(factor["secret"]), body.code):
         c.close()
         audit("mfa_step_up_failed", actor_id=principal["id"], target_id=principal["id"])
         raise HTTPException(401, "MFA step-up failed")
     ts = now()
+    if not str(factor["secret"]).startswith("enc:v1:"):
+        c.execute("UPDATE mfa_factors SET secret=? WHERE identity_id=?", (_mfa_secret_store(_mfa_secret_load(factor["secret"])), principal["id"]))
     c.execute("DELETE FROM session_mfa WHERE token_hash=?", (token_hash,))
     c.execute("INSERT INTO session_mfa(token_hash,mfa_time) VALUES(?,?)", (token_hash, ts))
     c.commit()
