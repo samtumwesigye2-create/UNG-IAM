@@ -136,6 +136,13 @@ def init_db():
           detail TEXT,
           created_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS recovery_codes(
+          code_hash TEXT PRIMARY KEY,
+          identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+          expires_at REAL NOT NULL,
+          used_at REAL,
+          created_at REAL NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS mfa_factors(
           identity_id TEXT PRIMARY KEY REFERENCES identities(id) ON DELETE CASCADE,
           secret TEXT NOT NULL,
@@ -407,45 +414,43 @@ def health():
             c.close()
 
 
-@app.post("/v1/auth/temporary-password")
-def issue_temporary_password(body: dict, authorization: str = Header(default="")):
-    """Issue a one-time temporary password using the deployment recovery secret.
+class RecoveryRedeemRequest(BaseModel):
+    email: str
+    code: str
+    new_password: str
 
-    The recovery secret authenticates this break-glass operation. The temporary
-    password is returned exactly once; only its scrypt hash is persisted.
-    """
-    email = str(body.get("email", "")).strip().lower()
-    if not email:
-        raise HTTPException(400, "email is required")
-    allowed = {
-        os.environ.get("UNG_IAM_RESET_EMAIL", "").strip().lower(),
-        os.environ.get("UNG_IAM_RESET_SOURCE_EMAIL", "").strip().lower(),
-        BOOTSTRAP_EMAIL,
-    }
-    allowed.discard("")
-    if email not in allowed:
-        audit("temporary_password_denied", detail=email)
-        raise HTTPException(403, "Identity is not eligible for deployment recovery")
 
+@app.post("/v1/auth/recovery/redeem")
+def redeem_recovery(body: RecoveryRedeemRequest):
+    email = body.email.strip().lower()
     c = db()
     row = c.execute("SELECT * FROM identities WHERE email=? AND identity_type='human'", (email,)).fetchone()
     if not row:
         c.close()
-        raise HTTPException(404, "Recovery identity not found")
-
-    temporary_password = "Tmp-" + secrets.token_urlsafe(18)
+        audit("recovery_failed", detail=email)
+        raise HTTPException(401, "Invalid or expired recovery code")
+    code_hash = hash_token(body.code.strip())
+    rec = c.execute(
+        "SELECT * FROM recovery_codes WHERE code_hash=? AND identity_id=? AND used_at IS NULL",
+        (code_hash, row["id"]),
+    ).fetchone()
+    if not rec or rec["expires_at"] <= now():
+        c.close()
+        audit("recovery_failed", target_id=row["id"], detail="invalid_or_expired")
+        raise HTTPException(401, "Invalid or expired recovery code")
+    try:
+        encoded = password_hash(body.new_password)
+    except ValueError as exc:
+        c.close()
+        raise HTTPException(400, str(exc))
     c.execute("UPDATE identities SET password_hash=?,is_active=1,updated_at=? WHERE id=?",
-              (password_hash(temporary_password), now(), row["id"]))
+              (encoded, now(), row["id"]))
+    c.execute("UPDATE recovery_codes SET used_at=? WHERE code_hash=?", (now(), code_hash))
     c.execute("DELETE FROM sessions WHERE identity_id=?", (row["id"],))
     c.commit()
     c.close()
-    audit("temporary_password_issued", actor_id="deployment-recovery", target_id=row["id"])
-    return {
-        "email": email,
-        "temporary_password": temporary_password,
-        "one_time_display": True,
-        "warning": "Store securely and replace after login.",
-    }
+    audit("administrator_recovered", actor_id=row["id"], target_id=row["id"])
+    return {"recovered": True, "email": email, "sessions_revoked": True}
 
 
 @app.post("/v1/auth/login")
