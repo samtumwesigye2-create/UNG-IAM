@@ -210,21 +210,9 @@ def init_db():
             )
             rid = c.execute("SELECT id FROM roles WHERE name='platform-admin'").fetchone()["id"]
             c.execute("INSERT INTO identity_roles(identity_id,role_id) VALUES(?,?)", (iid, rid))
-    # Controlled one-shot administrator recovery from deployment secrets.
-    reset_password = os.environ.get("UNG_IAM_RESET_PASSWORD", "")
-    reset_email = os.environ.get("UNG_IAM_RESET_EMAIL", "").strip().lower()
-    reset_source_email = os.environ.get("UNG_IAM_RESET_SOURCE_EMAIL", "").strip().lower()
-    recovery_target = reset_source_email or reset_email or BOOTSTRAP_EMAIL
-    if reset_password and recovery_target:
-        target = c.execute("SELECT id,email FROM identities WHERE email=? AND identity_type='human'", (recovery_target,)).fetchone()
-        if target:
-            new_email = reset_email or target["email"]
-            c.execute("UPDATE identities SET email=?,password_hash=?,is_active=1,updated_at=? WHERE id=?",
-                      (new_email, password_hash(reset_password), now(), target["id"]))
-            c.execute("DELETE FROM sessions WHERE identity_id=?", (target["id"],))
-            c.execute("INSERT INTO audit_events(id,event,actor_id,target_id,detail,created_at) VALUES(?,?,?,?,?,?)",
-                      (str(uuid.uuid4()), "administrator_recovery", "deployment-recovery",
-                       target["id"], "password reset; sessions revoked", now()))
+    # Legacy deployment-secret password reset removed. Password changes are now
+    # explicit through the audited recovery and password-management endpoints,
+    # so application restarts cannot overwrite an administrator's password.
 
     c.commit()
     c.close()
