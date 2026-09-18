@@ -360,6 +360,55 @@ def health():
             c.close()
 
 
+@app.post("/v1/auth/temporary-password")
+def issue_temporary_password(body: dict, authorization: str = Header(default="")):
+    """Issue a one-time temporary password using the deployment recovery secret.
+
+    The recovery secret authenticates this break-glass operation. The temporary
+    password is returned exactly once; only its scrypt hash is persisted.
+    """
+    recovery_secret = os.environ.get("UNG_IAM_RECOVERY_SECRET", "")
+    if not recovery_secret or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Recovery authorization required")
+    supplied = authorization.split(" ", 1)[1].strip()
+    if not hmac.compare_digest(supplied, recovery_secret):
+        audit("temporary_password_denied", detail="invalid recovery authorization")
+        raise HTTPException(401, "Recovery authorization required")
+
+    email = str(body.get("email", "")).strip().lower()
+    if not email:
+        raise HTTPException(400, "email is required")
+    allowed = {
+        os.environ.get("UNG_IAM_RESET_EMAIL", "").strip().lower(),
+        os.environ.get("UNG_IAM_RESET_SOURCE_EMAIL", "").strip().lower(),
+        BOOTSTRAP_EMAIL,
+    }
+    allowed.discard("")
+    if email not in allowed:
+        audit("temporary_password_denied", detail=email)
+        raise HTTPException(403, "Identity is not eligible for deployment recovery")
+
+    c = db()
+    row = c.execute("SELECT * FROM identities WHERE email=? AND identity_type='human'", (email,)).fetchone()
+    if not row:
+        c.close()
+        raise HTTPException(404, "Recovery identity not found")
+
+    temporary_password = "Tmp-" + secrets.token_urlsafe(18)
+    c.execute("UPDATE identities SET password_hash=?,is_active=1,updated_at=? WHERE id=?",
+              (password_hash(temporary_password), now(), row["id"]))
+    c.execute("DELETE FROM sessions WHERE identity_id=?", (row["id"],))
+    c.commit()
+    c.close()
+    audit("temporary_password_issued", actor_id="deployment-recovery", target_id=row["id"])
+    return {
+        "email": email,
+        "temporary_password": temporary_password,
+        "one_time_display": True,
+        "warning": "Store securely and replace after login.",
+    }
+
+
 @app.post("/v1/auth/login")
 def login(body: LoginRequest):
     email = body.email.strip().lower()
