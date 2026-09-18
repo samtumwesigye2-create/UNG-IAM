@@ -75,3 +75,13 @@ TOTP seed material used for SCIF step-up is encrypted at rest before being writt
 - New MFA factors are stored with AES-256-GCM using a fresh nonce and authenticated context.
 - Legacy plaintext factors remain temporarily readable only for migration and are automatically re-encrypted after the next successful MFA confirmation or step-up.
 - MFA factor encryption is separate from password hashing and bearer-session hashing.
+
+
+## SCIF-scoped authorization handles
+JANUS issues short-lived, high-assurance authorization handles for Digital SCIF sessions.
+
+- `POST /v1/auth/scif-handle` exchanges a freshly MFA-stepped-up human session for a short-lived `scif_` handle.
+- The handle is bound server-side to the parent JANUS session and becomes invalid when that session is invalid, expired, or removed.
+- `/v1/auth/introspect` accepts the SCIF handle and returns the same current identity and MFA assurance information while the parent session remains valid.
+- Only a hash of the SCIF handle is stored in JANUS.
+- Default lifetime is 5 minutes and can be configured with `UNG_IAM_SCIF_HANDLE_TTL` between 60 and 900 seconds.
