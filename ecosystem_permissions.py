@@ -51,6 +51,8 @@ PERMISSIONS = {
     'procure.match.write': 'Evaluate procurement three-way matches',
     'procure.config.read': 'Read procurement matching configuration',
     'procure.config.write': 'Manage procurement matching configuration',
+    'procure.production.read': 'Read S&OP, MPS, MRP, BOM and capacity plans',
+    'procure.production.write': 'Manage S&OP, MPS, MRP, BOM and capacity plans',
     'midas.ap.read': 'Read MIDAS supplier invoices and AP items',
     'midas.ap.write': 'Create and manage MIDAS supplier invoices',
     'midas.accounting.read': 'Read MIDAS accounting documents and trial balance',
