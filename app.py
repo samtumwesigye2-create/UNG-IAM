@@ -243,6 +243,23 @@ def init_db():
     # explicit through the audited recovery and password-management endpoints,
     # so application restarts cannot overwrite an administrator's password.
 
+    # Optional production machine bootstrap. The raw credential lives only in
+    # deployment secrets; IAM stores only its SHA-256 hash.
+    vector_token = os.environ.get("UNG_IAM_VECTOR_SERVICE_TOKEN", "").strip()
+    if vector_token:
+        row = c.execute("SELECT * FROM identities WHERE identity_type='service' AND display_name='UNG-VECTOR'").fetchone()
+        if not row:
+            iid = str(uuid.uuid4())
+            c.execute("INSERT INTO identities VALUES(?,?,?,?,?,?,1,?,?)",
+                      (iid, "service", "service", "UNG-VECTOR", None, None, now(), now()))
+            row = c.execute("SELECT * FROM identities WHERE id=?", (iid,)).fetchone()
+        else:
+            c.execute("UPDATE identities SET access_class='service',is_active=1,updated_at=? WHERE id=?", (now(), row["id"]))
+        role = c.execute("SELECT id FROM roles WHERE name='service'").fetchone()
+        c.execute("INSERT OR IGNORE INTO identity_roles(identity_id,role_id) VALUES(?,?)", (row["id"], role["id"]))
+        c.execute("INSERT OR IGNORE INTO service_credentials(credential_hash,identity_id,label,expires_at,created_at,last_used_at) VALUES(?,?,?,?,?,NULL)",
+                  (hash_token(vector_token), row["id"], "VECTOR-NEXUS-PRODUCTION", None, now()))
+
     c.commit()
     c.close()
 
