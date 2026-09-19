@@ -139,6 +139,15 @@ def init_db():
           detail TEXT,
           created_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS sso_codes(
+          code_hash TEXT PRIMARY KEY,
+          identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+          client_id TEXT NOT NULL,
+          redirect_uri TEXT NOT NULL,
+          expires_at REAL NOT NULL,
+          used_at REAL,
+          created_at REAL NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS recovery_codes(
           code_hash TEXT PRIMARY KEY,
           identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
@@ -224,6 +233,17 @@ init_db()
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+
+class SsoAuthorizeRequest(BaseModel):
+    client_id: str
+    redirect_uri: str
+
+
+class SsoExchangeRequest(BaseModel):
+    client_id: str
+    redirect_uri: str
+    code: str
 
 
 class IdentityCreate(BaseModel):
@@ -557,6 +577,57 @@ def redeem_recovery(body: RecoveryRedeemRequest):
     c.close()
     audit("administrator_recovered", actor_id=row["id"], target_id=row["id"])
     return {"recovered": True, "email": email, "sessions_revoked": True}
+
+
+def _sso_clients() -> dict[str, set[str]]:
+    raw = os.getenv("UNG_IAM_SSO_CLIENTS", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return {str(k): {str(u) for u in (v if isinstance(v, list) else [v])} for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def _validate_sso_client(client_id: str, redirect_uri: str):
+    allowed = _sso_clients().get(client_id, set())
+    if redirect_uri not in allowed:
+        raise HTTPException(400, "Unregistered SSO client or redirect URI")
+
+
+@app.post("/v1/sso/authorize")
+def sso_authorize(body: SsoAuthorizeRequest, me: dict = Depends(current_identity)):
+    _validate_sso_client(body.client_id, body.redirect_uri)
+    code = "sso_" + secrets.token_urlsafe(32)
+    c = db()
+    c.execute("DELETE FROM sso_codes WHERE expires_at<=? OR used_at IS NOT NULL", (now(),))
+    c.execute("INSERT INTO sso_codes(code_hash,identity_id,client_id,redirect_uri,expires_at,used_at,created_at) VALUES(?,?,?,?,?,NULL,?)",
+              (hash_token(code), me["id"], body.client_id, body.redirect_uri, now()+60, now()))
+    c.commit(); c.close()
+    audit("sso_code_issued", actor_id=me["id"], detail=body.client_id)
+    return {"code": code, "expires_in": 60}
+
+
+@app.post("/v1/sso/exchange")
+def sso_exchange(body: SsoExchangeRequest):
+    _validate_sso_client(body.client_id, body.redirect_uri)
+    c = db()
+    rec = c.execute("SELECT * FROM sso_codes WHERE code_hash=? AND client_id=? AND redirect_uri=? AND used_at IS NULL",
+                    (hash_token(body.code), body.client_id, body.redirect_uri)).fetchone()
+    if not rec or rec["expires_at"] <= now():
+        c.close(); raise HTTPException(401, "Invalid or expired SSO code")
+    row = c.execute("SELECT * FROM identities WHERE id=? AND is_active=1", (rec["identity_id"],)).fetchone()
+    if not row:
+        c.close(); raise HTTPException(401, "Identity unavailable")
+    c.execute("UPDATE sso_codes SET used_at=? WHERE code_hash=?", (now(), hash_token(body.code)))
+    raw = "iam_" + secrets.token_urlsafe(48); th = hash_token(raw)
+    c.execute("INSERT INTO sessions VALUES(?,?,?,?,?)", (th,row["id"],now()+SESSION_TTL,now(),now()))
+    who=payload(c,row); c.commit(); c.close()
+    audit("sso_exchange_success", actor_id=row["id"], detail=body.client_id)
+    return {"access_token":raw,"token_type":"bearer","expires_in":SESSION_TTL,"identity":who}
 
 
 @app.post("/v1/auth/login")
