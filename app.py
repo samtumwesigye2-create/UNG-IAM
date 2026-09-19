@@ -189,13 +189,32 @@ def init_db():
         "platform:vendor": "Access approved vendor systems",
         "platform:contractor": "Access approved contractor systems",
         "platform:service": "System-to-system access",
+        "vault:military:operate": "Create and protect VAULT-MIL records and files",
+        "vault:military:approve": "Approve or deny VAULT-MIL release requests",
+        "vault:military:records-admin": "Transfer, delete, and administer VAULT-MIL records",
+        "vault:military:audit": "Read VAULT-MIL audit, receipts, and delivery status",
     }
     for name, desc in seed_permissions.items():
         c.execute("INSERT OR IGNORE INTO permissions(name,description) VALUES(?,?)", (name, desc))
 
     roles = {
         "platform-admin": ("Full IAM administration", list(seed_permissions)),
-        "security-admin": ("Security/access administration", ["iam:read", "iam:roles", "iam:audit", "iam:revoke"]),
+        "security-admin": ("Security/access administration", [
+            "iam:read","iam:roles","iam:audit","iam:revoke",
+            "vault:military:approve","vault:military:records-admin","vault:military:audit"
+        ]),
+        "military-vault-operator": ("Operate VAULT-MIL protected records and files", [
+            "vault:military:operate"
+        ]),
+        "military-vault-approver": ("Approve or deny VAULT-MIL release requests", [
+            "vault:military:approve","vault:military:audit"
+        ]),
+        "military-vault-records-admin": ("Administer VAULT-MIL records and chain-of-custody actions", [
+            "vault:military:operate","vault:military:records-admin","vault:military:audit"
+        ]),
+        "military-vault-auditor": ("Read-only VAULT-MIL audit and receipt oversight", [
+            "vault:military:audit"
+        ]),
         "corporate-user": ("Corporate workforce access", ["platform:corporate"]),
         "vendor": ("Approved vendor access", ["platform:vendor"]),
         "contractor": ("Approved contractor access", ["platform:contractor"]),
