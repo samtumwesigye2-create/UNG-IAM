@@ -100,7 +100,8 @@ async function createIdentity(){try{const type=$('newType').value;const role=$('
 function esc(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
 function setTab(name){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));['identities','roles','audit'].forEach(n=>$(n+'Panel').classList.toggle('hidden',n!==name))}
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));$('loginBtn').onclick=login;$('changePasswordBtn').onclick=openSelfPassword;$('recoverBtn').onclick=startRecovery;$('issueCodeBtn').onclick=startRecovery;$('redeemBtn').onclick=redeemRecovery;$('logoutBtn').onclick=logout;$('newIdentityBtn').onclick=openModal;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});$('identityModal').addEventListener('click',e=>{if(e.target===$('identityModal'))closeModal()});$('passwordModal').addEventListener('click',e=>{if(e.target===$('passwordModal'))closePasswordModal()});
-if(token)showApp();
+async function handleSsoRequest(){const q=new URLSearchParams(location.search);const client=q.get('client_id'),redirect=q.get('redirect_uri'),state=q.get('state');if(!client||!redirect)return false;if(!token){$('loginError').textContent='Sign in once with JANUS to continue to '+client+'.';return true}try{const d=await api('/v1/sso/authorize',{method:'POST',body:JSON.stringify({client_id:client,redirect_uri:redirect})});const u=new URL(redirect);u.searchParams.set('code',d.code);if(state)u.searchParams.set('state',state);location.replace(u.toString())}catch(e){$('loginError').textContent=e.message}return true}
+(async()=>{const sso=await handleSsoRequest();if(!sso&&token)showApp()})();
 </script>
 </body></html>'''
 
