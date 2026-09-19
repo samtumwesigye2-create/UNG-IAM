@@ -4,6 +4,8 @@ from app import db, hash_token, now
 
 PERMISSIONS = {
     'ung.admin': 'Cross-platform UNG administrator override',
+    'ung.core.heartbeat.write': 'Publish service heartbeats to UNG-CORE',
+    'ung.core.audit.write': 'Write audit events to UNG-CORE',
     'nexus.endpoints.read': 'Read NEXUS endpoint registry',
     'nexus.endpoints.write': 'Manage NEXUS endpoint registry',
     'nexus.messages.read': 'Read NEXUS integration messages',
@@ -62,6 +64,7 @@ UGASHIP_VECTOR_SERVICE_TOKEN = os.environ.get('UGASHIP_VECTOR_SERVICE_TOKEN', ''
 MERCURY_VECTOR_SERVICE_TOKEN = os.environ.get('MERCURY_VECTOR_SERVICE_TOKEN', '').strip()
 ORACLE_VECTOR_SERVICE_TOKEN = os.environ.get('ORACLE_VECTOR_SERVICE_TOKEN', '').strip()
 EDGE_SERVICE_TOKEN = os.environ.get('UNG_EDGE_SERVICE_TOKEN', '').strip()
+HR_SERVICE_TOKEN = os.environ.get('UNG_HR_SERVICE_TOKEN', '').strip()
 
 
 def _ensure_service_identity(c, *, role_name, role_id, identity_id, display_name, permissions, token, label):
@@ -93,5 +96,6 @@ def seed_ecosystem_permissions():
         _ensure_service_identity(c, role_name='mercury-vector-service', role_id='role-mercury-vector-service', identity_id='svc-ung-mercury', display_name='UNG-MERCURY', permissions=('platform:service','nexus.messages.write','vector.locations.read','vector.inventory.read','vector.movements.read','vector.movements.write'), token=MERCURY_VECTOR_SERVICE_TOKEN, label='UNG-MERCURY to UNG-VECTOR production handoff')
         _ensure_service_identity(c, role_name='oracle-vector-read-service', role_id='role-oracle-vector-read-service', identity_id='svc-ung-oracle', display_name='UNG-ORACLE', permissions=('platform:service','vector.locations.read','vector.inventory.read','vector.movements.read'), token=ORACLE_VECTOR_SERVICE_TOKEN, label='UNG-ORACLE read-only VECTOR observation')
         _ensure_service_identity(c, role_name='edge-node-service', role_id='role-edge-node-service', identity_id='svc-ung-edge-001', display_name='UNG-EDGE-001', permissions=('platform:service','nexus.messages.write','edge.nodes.read','edge.events.write','edge.telemetry.write'), token=EDGE_SERVICE_TOKEN, label='UNG-EDGE-001 production node')
+        _ensure_service_identity(c, role_name='ugaforce-hr-service', role_id='role-ugaforce-hr-service', identity_id='svc-ugaforce-hr', display_name='UGAFORCE-HR', permissions=('platform:service','ung.core.heartbeat.write','ung.core.audit.write'), token=HR_SERVICE_TOKEN, label='UGAFORCE-HR production integration')
         c.commit()
     finally: c.close()
