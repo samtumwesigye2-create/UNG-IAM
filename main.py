@@ -1,6 +1,9 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from app import app as api_app
+from ecosystem_permissions import seed_ecosystem_permissions
+
+seed_ecosystem_permissions()
 
 app = FastAPI(title="UNG IAM Console", docs_url=None, redoc_url=None, openapi_url=None)
 
