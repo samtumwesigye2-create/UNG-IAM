@@ -1019,6 +1019,50 @@ def create_role(body: RoleCreate, admin: dict = Depends(require("iam:roles"))):
     return {"id": rid, "name": body.name, "permissions": body.permissions}
 
 
+@app.post("/v1/service-identities/bootstrap")
+def bootstrap_service_identity(
+    body: IdentityCreate,
+    admin: dict = Depends(require("iam:write")),
+):
+    """Idempotently create or repair a machine identity and its service role.
+
+    Credential material is intentionally not returned here; issue/rotate it with
+    the dedicated credentials endpoint so identity lifecycle and secret lifecycle
+    remain separately auditable.
+    """
+    if body.identity_type != "service" or body.access_class != "service":
+        raise HTTPException(400, "bootstrap requires identity_type=service and access_class=service")
+    name = body.display_name.strip()
+    c = db()
+    row = c.execute(
+        "SELECT * FROM identities WHERE identity_type='service' AND display_name=?", (name,)
+    ).fetchone()
+    created = False
+    if not row:
+        iid = str(uuid.uuid4())
+        c.execute(
+            "INSERT INTO identities VALUES(?,?,?,?,?,?,1,?,?)",
+            (iid, "service", "service", name, None, None, now(), now()),
+        )
+        row = c.execute("SELECT * FROM identities WHERE id=?", (iid,)).fetchone()
+        created = True
+    elif not row["is_active"] or row["access_class"] != "service":
+        c.execute(
+            "UPDATE identities SET access_class='service',is_active=1,updated_at=? WHERE id=?",
+            (now(), row["id"]),
+        )
+        row = c.execute("SELECT * FROM identities WHERE id=?", (row["id"],)).fetchone()
+    role = c.execute("SELECT id FROM roles WHERE name='service'").fetchone()
+    if not role:
+        c.close()
+        raise HTTPException(503, "service role is not configured")
+    c.execute("INSERT OR IGNORE INTO identity_roles(identity_id,role_id) VALUES(?,?)", (row["id"], role["id"]))
+    result = payload(c, c.execute("SELECT * FROM identities WHERE id=?", (row["id"],)).fetchone())
+    c.commit(); c.close()
+    audit("service_identity_bootstrapped", admin["id"], row["id"], name)
+    return {"created": created, "identity": result}
+
+
 @app.post("/v1/service-identities/{identity_id}/credentials")
 def create_service_credential(
     identity_id: str,
