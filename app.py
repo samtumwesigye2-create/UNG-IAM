@@ -714,7 +714,9 @@ def login(body: LoginRequest):
     c.commit()
     c.close()
     audit("login_success", actor_id=row["id"])
-    return {"access_token": raw, "token_type": "bearer", "expires_in": SESSION_TTL, "identity": who}
+    response = JSONResponse({"access_token": raw, "token_type": "bearer", "expires_in": SESSION_TTL, "identity": who})
+    response.set_cookie("ung_iam_session", raw, max_age=SESSION_TTL, httponly=True, secure=True, samesite="lax")
+    return response
 
 
 @app.post("/v1/auth/mfa/enroll")
