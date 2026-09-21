@@ -20,6 +20,7 @@ SESSION_TTL = max(300, int(os.environ.get("UNG_IAM_SESSION_TTL", "28800")))
 COOKIE_NAME = "ung_iam_session"
 DEFAULT_CLIENTS = {
     "UNG-MDM": ["https://ung-mdm-production.up.railway.app/sso/callback"],
+    "UNG-VECTOR": ["https://ung-vector-production.up.railway.app/v1/acceptance/callback"],
 }
 
 
