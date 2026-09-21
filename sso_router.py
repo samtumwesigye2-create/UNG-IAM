@@ -45,7 +45,10 @@ def clients() -> dict[str, list[str]]:
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
             raise ValueError
-        return {str(k): [str(x) for x in v] for k, v in parsed.items() if isinstance(v, list)}
+        configured={str(k): [str(x) for x in v] for k, v in parsed.items() if isinstance(v, list)}
+        merged={k:list(v) for k,v in DEFAULT_CLIENTS.items()}
+        merged.update(configured)
+        return merged
     except Exception:
         raise RuntimeError("Invalid UNG_IAM_SSO_CLIENTS JSON")
 
