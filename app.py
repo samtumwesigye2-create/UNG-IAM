@@ -18,6 +18,7 @@ import uuid
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -501,6 +502,7 @@ def current_identity(authorization: str = Header(default="")) -> dict:
     principal = resolve_principal(raw)
     if not principal:
         raise HTTPException(401, "Token invalid or expired")
+    principal["_original_token"] = raw
     return principal
 
 
@@ -899,7 +901,7 @@ def create_identity(body: IdentityCreate, admin: dict = Depends(require("iam:wri
 
 
 @app.post("/v1/me/password")
-def change_my_password(body: PasswordChangeRequest, principal: dict = Depends(require("iam:read"))):
+def change_my_password(body: PasswordChangeRequest, principal: dict = Depends(current_identity)):
     c = db()
     row = c.execute("SELECT * FROM identities WHERE id=? AND identity_type='human'", (principal["id"],)).fetchone()
     if not row or not row["password_hash"] or not password_valid(body.current_password, row["password_hash"]):
