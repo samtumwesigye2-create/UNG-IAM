@@ -1,0 +1,1 @@
+Production gate remains HOLD until Railway runs entrypoint:app with UNG_IAM_RECOVERY_SECRET configured and live acceptance checks pass.
