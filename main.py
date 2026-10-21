@@ -1,6 +1,9 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from app import app as api_app
+from ecosystem_permissions import seed_ecosystem_permissions
+
+seed_ecosystem_permissions()
 
 app = FastAPI(title="UNG IAM Console", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -34,7 +37,12 @@ label{display:block;font-size:13px;font-weight:700;margin:14px 0 7px}.field{widt
     <div class="brand"><div class="mark">IAM</div><div><h1>UNG Identity & Access</h1><p>Corporate administration console</p></div></div>
     <label for="email">Administrator email</label><input id="email" class="field" type="email" autocomplete="username" placeholder="name@organization">
     <label for="password">Password</label><input id="password" class="field" type="password" autocomplete="current-password" placeholder="Enter password">
-    <button id="loginBtn" class="primary wide">Sign in</button><div id="loginError" class="error"></div>
+    <button id="loginBtn" class="primary wide">Sign in</button><button id="recoverBtn" class="secondary wide" style="margin-top:10px">Recover administrator account</button><div id="loginError" class="error"></div>
+    <div id="recoveryBox" class="hidden">
+      <label>Recovery code</label><div class="row"><input id="recoveryCode" class="field" readonly><button id="issueCodeBtn" class="secondary">Issue code</button></div>
+      <label>New password</label><input id="recoveryPassword" class="field" type="password" autocomplete="new-password" placeholder="Minimum 12 characters">
+      <button id="redeemBtn" class="primary wide">Reset password</button>
+    </div>
     <div class="note">Authorized administrators only. Access is logged.</div>
   </div>
 </section>
@@ -42,7 +50,7 @@ label{display:block;font-size:13px;font-weight:700;margin:14px 0 7px}.field{widt
 <section id="appView" class="shell hidden">
   <header class="topbar"><div class="topbar-inner"><div><div class="top-title">UNG IAM</div><div class="top-sub"><span class="status-dot"></span>Production • PostgreSQL</div></div><button id="logoutBtn" class="secondary">Sign out</button></div></header>
   <main class="main">
-    <div class="hero"><div><h2>Identity Administration</h2><p id="welcome">Manage people, roles and access across the UNG ecosystem.</p></div><button id="newIdentityBtn" class="primary">+ New identity</button></div>
+    <div class="hero"><div><h2>Identity Administration</h2><p id="welcome">Manage people, roles and access across the UNG ecosystem.</p></div><div class="toolbar"><button id="changePasswordBtn" class="secondary">Change my password</button><button id="newIdentityBtn" class="primary">+ New identity</button></div></div>
     <div class="cards">
       <div class="card"><div class="small">Identities</div><div id="identityCount" class="metric">—</div></div>
       <div class="card"><div class="small">Active</div><div id="activeCount" class="metric">—</div></div>
@@ -57,6 +65,13 @@ label{display:block;font-size:13px;font-weight:700;margin:14px 0 7px}.field{widt
   </main>
 </section>
 
+<div id="passwordModal" class="modal hidden"><div class="sheet"><h3 id="passwordModalTitle">Change password</h3>
+  <div id="currentPasswordWrap"><label>Current password</label><input id="currentPassword" class="field" type="password" autocomplete="current-password"></div>
+  <label>New password <span class="small">(minimum 12 characters)</span></label><input id="managedNewPassword" class="field" type="password" autocomplete="new-password">
+  <div id="passwordModalError" class="error"></div>
+  <div class="actions"><button class="secondary" onclick="closePasswordModal()">Cancel</button><button id="savePasswordBtn" class="primary" onclick="savePassword()">Save password</button></div>
+</div></div>
+
 <div id="identityModal" class="modal hidden"><div class="sheet"><h3>Create identity</h3>
   <div class="row"><div><label>Display name</label><input id="newName" class="field"></div><div><label>Email</label><input id="newEmail" class="field" type="email"></div></div>
   <div class="row"><div><label>Identity type</label><select id="newType" class="field"><option value="human">Human</option><option value="service">Service</option></select></div><div><label>Access class</label><select id="newClass" class="field"><option value="corporate">Corporate</option><option value="vendor">Vendor</option><option value="contractor">Contractor</option><option value="service">Service</option></select></div></div>
@@ -66,23 +81,30 @@ label{display:block;font-size:13px;font-weight:700;margin:14px 0 7px}.field{widt
 </div></div>
 
 <script>
-let token=sessionStorage.getItem('ung_iam_token')||'';let me=null;let roles=[];
+let token=sessionStorage.getItem('ung_iam_token')||'';let me=null;let roles=[];let passwordTarget=null;
 const $=id=>document.getElementById(id);
 async function api(path,opts={}){opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});if(token)opts.headers.Authorization='Bearer '+token;const r=await fetch(path,opts);let data={};try{data=await r.json()}catch(e){}if(!r.ok)throw new Error(data.detail||('Request failed: '+r.status));return data}
-async function login(){ $('loginError').textContent='';$('loginBtn').disabled=true;try{const d=await api('/v1/auth/login',{method:'POST',body:JSON.stringify({email:$('email').value.trim(),password:$('password').value})});token=d.access_token;sessionStorage.setItem('ung_iam_token',token);me=d.identity;await showApp()}catch(e){$('loginError').textContent=e.message}finally{$('loginBtn').disabled=false}}
+async function startRecovery(){ $('loginError').textContent='';$('recoveryBox').classList.remove('hidden');$('issueCodeBtn').disabled=true;try{const d=await api('/v1/auth/recovery/issue',{method:'POST',body:JSON.stringify({email:$('email').value.trim()})});$('recoveryCode').value=d.recovery_code;$('loginError').textContent='One-time code issued. It expires in 10 minutes.'}catch(e){$('loginError').textContent=e.message}finally{$('issueCodeBtn').disabled=false}}
+async function redeemRecovery(){ $('loginError').textContent='';try{await api('/v1/auth/recovery/redeem',{method:'POST',body:JSON.stringify({email:$('email').value.trim(),code:$('recoveryCode').value.trim(),new_password:$('recoveryPassword').value})});$('password').value=$('recoveryPassword').value;$('recoveryPassword').value='';$('recoveryCode').value='';$('recoveryBox').classList.add('hidden');$('loginError').textContent='Password reset. Sign in with your new password.'}catch(e){$('loginError').textContent=e.message}}
+async function login(){ $('loginError').textContent='';$('loginBtn').disabled=true;try{const d=await api('/v1/auth/login',{method:'POST',credentials:'include',body:JSON.stringify({email:$('email').value.trim(),password:$('password').value})});token=d.access_token;sessionStorage.setItem('ung_iam_token',token);me=d.identity;await showApp()}catch(e){$('loginError').textContent=e.message}finally{$('loginBtn').disabled=false}}
 async function showApp(){try{if(!me)me=await api('/v1/me');$('loginView').classList.add('hidden');$('appView').classList.remove('hidden');$('welcome').textContent='Signed in as '+me.display_name+' • '+(me.roles||[]).join(', ');await loadAll()}catch(e){sessionStorage.removeItem('ung_iam_token');token='';$('appView').classList.add('hidden');$('loginView').classList.remove('hidden')}}
 async function logout(){try{await api('/v1/auth/logout',{method:'POST'})}catch(e){}sessionStorage.removeItem('ung_iam_token');token='';me=null;location.reload()}
 async function loadAll(){await Promise.all([loadIdentities(),loadRoles(),loadAudit()])}
-async function loadIdentities(){try{const d=await api('/v1/identities');$('identityCount').textContent=d.count;$('activeCount').textContent=d.results.filter(x=>x.is_active).length;const body=$('identityRows');body.innerHTML='';d.results.forEach(x=>{const tr=document.createElement('tr');tr.innerHTML=`<td><strong>${esc(x.display_name)}</strong></td><td>${esc(x.email||'—')}</td><td>${esc(x.identity_type)}</td><td><span class="pill">${esc(x.access_class)}</span></td><td>${esc((x.roles||[]).join(', ')||'—')}</td><td><span class="pill ${x.is_active?'ok':'off'}">${x.is_active?'Active':'Disabled'}</span></td><td><button class="secondary" onclick="revoke('${x.id}')">Revoke</button></td>`;body.appendChild(tr)});$('identityEmpty').classList.toggle('hidden',d.count!==0)}catch(e){if(e.message.includes('401'))logout()}}
+async function loadIdentities(){try{const d=await api('/v1/identities');$('identityCount').textContent=d.count;$('activeCount').textContent=d.results.filter(x=>x.is_active).length;const body=$('identityRows');body.innerHTML='';d.results.forEach(x=>{const tr=document.createElement('tr');const reset=x.identity_type==='human'?'<button class="secondary" onclick="openAdminPasswordReset(\''+x.id+'\',\''+esc(x.display_name).replace(/'/g,'&#39;')+'\')">Reset password</button> ':'';tr.innerHTML=`<td><strong>${esc(x.display_name)}</strong></td><td>${esc(x.email||'—')}</td><td>${esc(x.identity_type)}</td><td><span class="pill">${esc(x.access_class)}</span></td><td>${esc((x.roles||[]).join(', ')||'—')}</td><td><span class="pill ${x.is_active?'ok':'off'}">${x.is_active?'Active':'Disabled'}</span></td><td>${reset}<button class="secondary" onclick="revoke('${x.id}')">Revoke</button></td>`;body.appendChild(tr)});$('identityEmpty').classList.toggle('hidden',d.count!==0)}catch(e){if(e.message.includes('401'))logout()}}
 async function loadRoles(){try{const d=await api('/v1/roles');roles=d.results;$('roleCount').textContent=d.count;const body=$('roleRows');body.innerHTML='';roles.forEach(r=>{const tr=document.createElement('tr');tr.innerHTML=`<td><strong>${esc(r.name)}</strong></td><td>${esc(r.description||'')}</td><td>${esc((r.permissions||[]).join(', '))}</td>`;body.appendChild(tr)});const s=$('newRole');s.innerHTML='<option value="">No role</option>'+roles.map(r=>`<option value="${esc(r.name)}">${esc(r.name)}</option>`).join('')}catch(e){}}
 async function loadAudit(){try{const d=await api('/v1/audit?limit=50');$('auditCount').textContent=d.count;const box=$('auditRows');box.innerHTML='';d.results.forEach(x=>{const el=document.createElement('div');el.className='event';el.innerHTML=`<strong>${esc(x.event)}</strong><div>${new Date(x.created_at*1000).toLocaleString()}${x.detail?' • '+esc(x.detail):''}</div>`;box.appendChild(el)});if(!d.count)box.innerHTML='<div class="empty">No audit events yet.</div>'}catch(e){$('auditRows').innerHTML='<div class="empty">Audit data unavailable for this role.</div>'}}
 async function revoke(id){if(!confirm('Revoke all sessions and service credentials for this identity?'))return;try{await api('/v1/identities/'+id+'/revoke',{method:'POST'});await loadAudit()}catch(e){alert(e.message)}}
+function openSelfPassword(){passwordTarget='self';$('passwordModalTitle').textContent='Change my password';$('currentPasswordWrap').classList.remove('hidden');$('currentPassword').value='';$('managedNewPassword').value='';$('passwordModalError').textContent='';$('passwordModal').classList.remove('hidden')}
+function openAdminPasswordReset(id,name){passwordTarget=id;$('passwordModalTitle').textContent='Reset password — '+name;$('currentPasswordWrap').classList.add('hidden');$('currentPassword').value='';$('managedNewPassword').value='';$('passwordModalError').textContent='';$('passwordModal').classList.remove('hidden')}
+function closePasswordModal(){$('passwordModal').classList.add('hidden');passwordTarget=null}
+async function savePassword(){try{const np=$('managedNewPassword').value;if(passwordTarget==='self'){await api('/v1/me/password',{method:'POST',body:JSON.stringify({current_password:$('currentPassword').value,new_password:np})});sessionStorage.removeItem('ung_iam_token');token='';alert('Password changed. All sessions were signed out. Sign in again with the new password.');location.reload()}else{await api('/v1/identities/'+passwordTarget+'/password',{method:'POST',body:JSON.stringify({new_password:np})});closePasswordModal();alert('Password reset. Existing sessions for that identity were revoked.');await loadAudit()}}catch(e){$('passwordModalError').textContent=e.message}}
 function openModal(){$('modalError').textContent='';$('identityModal').classList.remove('hidden')}function closeModal(){$('identityModal').classList.add('hidden')}
 async function createIdentity(){try{const type=$('newType').value;const role=$('newRole').value;const payload={display_name:$('newName').value.trim(),email:$('newEmail').value.trim()||null,password:$('newPassword').value||null,identity_type:type,access_class:$('newClass').value,roles:role?[role]:[]};if(type==='service'){payload.email=null;payload.password=null}await api('/v1/identities',{method:'POST',body:JSON.stringify(payload)});closeModal();$('newName').value='';$('newEmail').value='';$('newPassword').value='';await loadAll()}catch(e){$('modalError').textContent=e.message}}
 function esc(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
 function setTab(name){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));['identities','roles','audit'].forEach(n=>$(n+'Panel').classList.toggle('hidden',n!==name))}
-document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));$('loginBtn').onclick=login;$('logoutBtn').onclick=logout;$('newIdentityBtn').onclick=openModal;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});$('identityModal').addEventListener('click',e=>{if(e.target===$('identityModal'))closeModal()});
-if(token)showApp();
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));$('loginBtn').onclick=login;$('changePasswordBtn').onclick=openSelfPassword;$('recoverBtn').onclick=startRecovery;$('issueCodeBtn').onclick=startRecovery;$('redeemBtn').onclick=redeemRecovery;$('logoutBtn').onclick=logout;$('newIdentityBtn').onclick=openModal;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});$('identityModal').addEventListener('click',e=>{if(e.target===$('identityModal'))closeModal()});$('passwordModal').addEventListener('click',e=>{if(e.target===$('passwordModal'))closePasswordModal()});
+async function handleSsoRequest(){const q=new URLSearchParams(location.search);const client=q.get('client_id'),redirect=q.get('redirect_uri'),state=q.get('state');if(!client||!redirect)return false;if(!token){$('loginError').textContent='Sign in once with JANUS to continue to '+client+'.';return true}try{const d=await api('/v1/sso/authorize',{method:'POST',body:JSON.stringify({client_id:client,redirect_uri:redirect})});const u=new URL(redirect);u.searchParams.set('code',d.code);if(state)u.searchParams.set('state',state);location.replace(u.toString())}catch(e){$('loginError').textContent=e.message}return true}
+(async()=>{const sso=await handleSsoRequest();if(!sso&&token)showApp()})();
 </script>
 </body></html>'''
 

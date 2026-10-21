@@ -20,6 +20,7 @@ SESSION_TTL = max(300, int(os.environ.get("UNG_IAM_SESSION_TTL", "28800")))
 COOKIE_NAME = "ung_iam_session"
 DEFAULT_CLIENTS = {
     "UNG-MDM": ["https://ung-mdm-production.up.railway.app/sso/callback"],
+    "UNG-VECTOR": ["https://ung-vector-production.up.railway.app/v1/acceptance/callback"],
 }
 
 
@@ -44,7 +45,10 @@ def clients() -> dict[str, list[str]]:
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
             raise ValueError
-        return {str(k): [str(x) for x in v] for k, v in parsed.items() if isinstance(v, list)}
+        configured={str(k): [str(x) for x in v] for k, v in parsed.items() if isinstance(v, list)}
+        merged={k:list(v) for k,v in DEFAULT_CLIENTS.items()}
+        merged.update(configured)
+        return merged
     except Exception:
         raise RuntimeError("Invalid UNG_IAM_SSO_CLIENTS JSON")
 

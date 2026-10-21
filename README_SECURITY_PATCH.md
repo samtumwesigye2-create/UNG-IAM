@@ -1,0 +1,1 @@
+See SECURITY_CHANGELOG_2026-10-05.md and DEPLOYMENT_CHECKLIST_2026-10-05.md for the reviewed IAM security patch and deployment steps.

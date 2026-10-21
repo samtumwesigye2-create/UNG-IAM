@@ -55,3 +55,33 @@ Health endpoint: `GET /health`
 ## Integration architecture
 
 UNG IAM will issue and manage identities while UNG Sentinel remains the security monitoring and protection authority. Applications such as UGAMAP, UGASHIP, WMS400Vector, UGAFORCE-HR, UNG-UAS and future platforms should validate identity/access through IAM integration instead of maintaining independent long-term identity stores.
+
+
+## SCIF step-up MFA
+UNG IAM now provides TOTP-based multi-factor enrollment and explicit step-up authentication for high-assurance applications such as UNG-VAULT Digital SCIF.
+
+- `POST /v1/auth/mfa/enroll` starts TOTP enrollment and returns an `otpauth://` URI.
+- `POST /v1/auth/mfa/confirm` confirms enrollment with a 6-digit code.
+- `POST /v1/auth/step-up` verifies a fresh TOTP code for the current bearer session.
+- `POST /v1/auth/introspect` returns the current principal plus MFA evidence.
+- Step-up evidence includes `mfa=true`, `mfa_time`, `amr`, `acr`, and session `auth_time`.
+- MFA state is session-specific. A new login does not inherit a prior session's step-up.
+
+
+## Encrypted MFA factor storage
+TOTP seed material used for SCIF step-up is encrypted at rest before being written to the IAM database.
+
+- `UNG_IAM_MFA_KEY_B64` must contain a base64-encoded 32-byte AES key.
+- New MFA factors are stored with AES-256-GCM using a fresh nonce and authenticated context.
+- Legacy plaintext factors remain temporarily readable only for migration and are automatically re-encrypted after the next successful MFA confirmation or step-up.
+- MFA factor encryption is separate from password hashing and bearer-session hashing.
+
+
+## SCIF-scoped authorization handles
+JANUS issues short-lived, high-assurance authorization handles for Digital SCIF sessions.
+
+- `POST /v1/auth/scif-handle` exchanges a freshly MFA-stepped-up human session for a short-lived `scif_` handle.
+- The handle is bound server-side to the parent JANUS session and becomes invalid when that session is invalid, expired, or removed.
+- `/v1/auth/introspect` accepts the SCIF handle and returns the same current identity and MFA assurance information while the parent session remains valid.
+- Only a hash of the SCIF handle is stored in JANUS.
+- Default lifetime is 5 minutes and can be configured with `UNG_IAM_SCIF_HANDLE_TTL` between 60 and 900 seconds.

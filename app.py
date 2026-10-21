@@ -5,23 +5,30 @@ UNG_IAM_DATABASE_URL. SQLite remains a local-development fallback only.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import sqlite3
+import struct
 import time
 import uuid
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from db import connect, database_name, is_postgres
 
 SESSION_TTL = max(300, int(os.environ.get("UNG_IAM_SESSION_TTL", "28800")))
+SCIF_HANDLE_TTL = max(60, min(900, int(os.environ.get("UNG_IAM_SCIF_HANDLE_TTL", "300"))))
 BOOTSTRAP_EMAIL = os.environ.get("UNG_IAM_BOOTSTRAP_EMAIL", "").strip().lower()
 BOOTSTRAP_PASSWORD = os.environ.get("UNG_IAM_BOOTSTRAP_PASSWORD", "")
+MFA_KEY_B64 = os.environ.get("UNG_IAM_MFA_KEY_B64", "").strip()
 
 app = FastAPI(
     title="UNG IAM",
@@ -134,6 +141,40 @@ def init_db():
           detail TEXT,
           created_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS sso_codes(
+          code_hash TEXT PRIMARY KEY,
+          identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+          client_id TEXT NOT NULL,
+          redirect_uri TEXT NOT NULL,
+          expires_at REAL NOT NULL,
+          used_at REAL,
+          created_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS recovery_codes(
+          code_hash TEXT PRIMARY KEY,
+          identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+          expires_at REAL NOT NULL,
+          used_at REAL,
+          created_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS mfa_factors(
+          identity_id TEXT PRIMARY KEY REFERENCES identities(id) ON DELETE CASCADE,
+          secret TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 0,
+          created_at REAL NOT NULL,
+          confirmed_at REAL
+        );
+        CREATE TABLE IF NOT EXISTS session_mfa(
+          token_hash TEXT PRIMARY KEY REFERENCES sessions(token_hash) ON DELETE CASCADE,
+          mfa_time REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS scif_handles(
+          handle_hash TEXT PRIMARY KEY,
+          identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+          parent_token_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE,
+          expires_at REAL NOT NULL,
+          created_at REAL NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_sessions_identity ON sessions(identity_id);
         CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at DESC);
         """
@@ -149,13 +190,32 @@ def init_db():
         "platform:vendor": "Access approved vendor systems",
         "platform:contractor": "Access approved contractor systems",
         "platform:service": "System-to-system access",
+        "vault:military:operate": "Create and protect VAULT-MIL records and files",
+        "vault:military:approve": "Approve or deny VAULT-MIL release requests",
+        "vault:military:records-admin": "Transfer, delete, and administer VAULT-MIL records",
+        "vault:military:audit": "Read VAULT-MIL audit, receipts, and delivery status",
     }
     for name, desc in seed_permissions.items():
         c.execute("INSERT OR IGNORE INTO permissions(name,description) VALUES(?,?)", (name, desc))
 
     roles = {
         "platform-admin": ("Full IAM administration", list(seed_permissions)),
-        "security-admin": ("Security/access administration", ["iam:read", "iam:roles", "iam:audit", "iam:revoke"]),
+        "security-admin": ("Security/access administration", [
+            "iam:read","iam:roles","iam:audit","iam:revoke",
+            "vault:military:approve","vault:military:records-admin","vault:military:audit"
+        ]),
+        "military-vault-operator": ("Operate VAULT-MIL protected records and files", [
+            "vault:military:operate"
+        ]),
+        "military-vault-approver": ("Approve or deny VAULT-MIL release requests", [
+            "vault:military:approve","vault:military:audit"
+        ]),
+        "military-vault-records-admin": ("Administer VAULT-MIL records and chain-of-custody actions", [
+            "vault:military:operate","vault:military:records-admin","vault:military:audit"
+        ]),
+        "military-vault-auditor": ("Read-only VAULT-MIL audit and receipt oversight", [
+            "vault:military:audit"
+        ]),
         "corporate-user": ("Corporate workforce access", ["platform:corporate"]),
         "vendor": ("Approved vendor access", ["platform:vendor"]),
         "contractor": ("Approved contractor access", ["platform:contractor"]),
@@ -180,6 +240,27 @@ def init_db():
             )
             rid = c.execute("SELECT id FROM roles WHERE name='platform-admin'").fetchone()["id"]
             c.execute("INSERT INTO identity_roles(identity_id,role_id) VALUES(?,?)", (iid, rid))
+    # Legacy deployment-secret password reset removed. Password changes are now
+    # explicit through the audited recovery and password-management endpoints,
+    # so application restarts cannot overwrite an administrator's password.
+
+    # Optional production machine bootstrap. The raw credential lives only in
+    # deployment secrets; IAM stores only its SHA-256 hash.
+    vector_token = os.environ.get("UNG_IAM_VECTOR_SERVICE_TOKEN", "").strip()
+    if vector_token:
+        row = c.execute("SELECT * FROM identities WHERE identity_type='service' AND display_name='UNG-VECTOR'").fetchone()
+        if not row:
+            iid = str(uuid.uuid4())
+            c.execute("INSERT INTO identities VALUES(?,?,?,?,?,?,1,?,?)",
+                      (iid, "service", "service", "UNG-VECTOR", None, None, now(), now()))
+            row = c.execute("SELECT * FROM identities WHERE id=?", (iid,)).fetchone()
+        else:
+            c.execute("UPDATE identities SET access_class='service',is_active=1,updated_at=? WHERE id=?", (now(), row["id"]))
+        role = c.execute("SELECT id FROM roles WHERE name='service'").fetchone()
+        c.execute("INSERT OR IGNORE INTO identity_roles(identity_id,role_id) VALUES(?,?)", (row["id"], role["id"]))
+        c.execute("INSERT OR IGNORE INTO service_credentials(credential_hash,identity_id,label,expires_at,created_at,last_used_at) VALUES(?,?,?,?,?,NULL)",
+                  (hash_token(vector_token), row["id"], "VECTOR-NEXUS-PRODUCTION", None, now()))
+
     c.commit()
     c.close()
 
@@ -190,6 +271,17 @@ init_db()
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+
+class SsoAuthorizeRequest(BaseModel):
+    client_id: str
+    redirect_uri: str
+
+
+class SsoExchangeRequest(BaseModel):
+    client_id: str
+    redirect_uri: str
+    code: str
 
 
 class IdentityCreate(BaseModel):
@@ -209,15 +301,78 @@ class IdentityUpdate(BaseModel):
     roles: Optional[list[str]] = None
 
 
+class PasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class AdminPasswordResetRequest(BaseModel):
+    new_password: str
+
+
 class RoleCreate(BaseModel):
     name: str = Field(min_length=2, max_length=80)
     description: str = ""
     permissions: list[str] = []
 
 
+class MfaCodeRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=8)
+
+
 class ServiceCredentialRequest(BaseModel):
     label: str = Field(min_length=2, max_length=120)
     ttl_seconds: Optional[int] = Field(default=None, ge=300, le=31536000)
+
+
+def _mfa_key() -> bytes:
+    if not MFA_KEY_B64:
+        raise HTTPException(503, "MFA encryption key is not configured")
+    try:
+        key = base64.b64decode(MFA_KEY_B64, validate=True)
+    except Exception as exc:
+        raise HTTPException(503, "MFA encryption key is invalid") from exc
+    if len(key) != 32:
+        raise HTTPException(503, "MFA encryption key must be 32 bytes")
+    return key
+
+
+def _mfa_secret_store(secret_b32: str) -> str:
+    nonce = secrets.token_bytes(12)
+    ciphertext = AESGCM(_mfa_key()).encrypt(nonce, secret_b32.encode("ascii"), b"UNG-IAM-MFA-v1")
+    return "enc:v1:" + base64.b64encode(nonce + ciphertext).decode("ascii")
+
+
+def _mfa_secret_load(stored: str) -> str:
+    if not stored.startswith("enc:v1:"):
+        # Legacy plaintext factor. It is accepted temporarily and is re-encrypted
+        # on the next successful confirmation/step-up.
+        return stored
+    try:
+        raw = base64.b64decode(stored.split(":", 2)[2], validate=True)
+        nonce, ciphertext = raw[:12], raw[12:]
+        return AESGCM(_mfa_key()).decrypt(nonce, ciphertext, b"UNG-IAM-MFA-v1").decode("ascii")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(503, "Stored MFA factor cannot be decrypted") from exc
+
+
+def _totp_code(secret_b32: str, at: Optional[float] = None) -> str:
+    counter = int((at if at is not None else now()) // 30)
+    key = base64.b32decode(secret_b32 + "=" * ((8 - len(secret_b32) % 8) % 8), casefold=True)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return f"{value % 1000000:06d}"
+
+
+def _totp_valid(secret_b32: str, code: str) -> bool:
+    candidate = "".join(ch for ch in str(code) if ch.isdigit())
+    if len(candidate) != 6:
+        return False
+    t = now()
+    return any(hmac.compare_digest(_totp_code(secret_b32, t + step * 30), candidate) for step in (-1, 0, 1))
 
 
 def permissions_for(c, identity_id: str) -> set[str]:
@@ -265,15 +420,28 @@ def resolve_principal(raw: str) -> Optional[dict]:
     try:
         # Check for active session token first
         session = c.execute(
-            """SELECT i.*, s.expires_at, 'session' AS credential_kind
+            """SELECT i.*, s.expires_at, s.created_at AS session_created_at, 'session' AS credential_kind
                FROM sessions s JOIN identities i ON i.id=s.identity_id
                WHERE s.token_hash=?""",
             (token_hash,),
         ).fetchone()
         if session and session["expires_at"] > now() and session["is_active"]:
             c.execute("UPDATE sessions SET last_seen_at=? WHERE token_hash=?", (now(), token_hash))
+            mfa_row = c.execute("SELECT mfa_time FROM session_mfa WHERE token_hash=?", (token_hash,)).fetchone()
             c.commit()
-            return payload(c, session)
+            result = payload(c, session)
+            result["auth_time"] = session["session_created_at"]
+            result["credential_kind"] = "session"
+            if mfa_row:
+                result["mfa"] = True
+                result["mfa_time"] = mfa_row["mfa_time"]
+                result["amr"] = ["pwd", "otp", "mfa"]
+                result["acr"] = "urn:ung:loa:scif-step-up"
+            else:
+                result["mfa"] = False
+                result["amr"] = ["pwd"]
+                result["acr"] = "urn:ung:loa:password"
+            return result
 
         # Check for valid service credential
         service = c.execute(
@@ -292,6 +460,37 @@ def resolve_principal(raw: str) -> Optional[dict]:
         c.close()
 
 
+def resolve_scif_handle(raw: str) -> Optional[dict]:
+    token_hash = hash_token(raw)
+    c = db()
+    try:
+        row = c.execute(
+            """SELECT h.identity_id,h.parent_token_hash,h.expires_at,
+                      s.expires_at AS session_expires_at,s.created_at AS session_created_at,
+                      i.*
+               FROM scif_handles h
+               JOIN sessions s ON s.token_hash=h.parent_token_hash
+               JOIN identities i ON i.id=h.identity_id
+               WHERE h.handle_hash=?""",
+            (token_hash,),
+        ).fetchone()
+        if not row or row["expires_at"] <= now() or row["session_expires_at"] <= now() or not row["is_active"]:
+            return None
+        mfa_row = c.execute("SELECT mfa_time FROM session_mfa WHERE token_hash=?", (row["parent_token_hash"],)).fetchone()
+        if not mfa_row:
+            return None
+        result = payload(c, row)
+        result["auth_time"] = row["session_created_at"]
+        result["credential_kind"] = "scif_handle"
+        result["mfa"] = True
+        result["mfa_time"] = mfa_row["mfa_time"]
+        result["amr"] = ["pwd", "otp", "mfa"]
+        result["acr"] = "urn:ung:loa:scif-step-up"
+        return result
+    finally:
+        c.close()
+
+
 def current_identity(authorization: str = Header(default="")) -> dict:
     """
     Dependency for endpoints requiring authentication.
@@ -303,6 +502,7 @@ def current_identity(authorization: str = Header(default="")) -> dict:
     principal = resolve_principal(raw)
     if not principal:
         raise HTTPException(401, "Token invalid or expired")
+    principal["_original_token"] = raw
     return principal
 
 
@@ -344,12 +544,167 @@ def health():
             c.close()
 
 
+class RecoveryIssueRequest(BaseModel):
+    email: str
+
+
+class RecoveryRedeemRequest(BaseModel):
+    email: str
+    code: str
+    new_password: str
+
+
+@app.post("/v1/auth/recovery/issue")
+def issue_recovery(body: RecoveryIssueRequest):
+    """Issue a short-lived single-use code only for the configured recovery identity."""
+    email = body.email.strip().lower()
+    c = db()
+    row = c.execute("SELECT * FROM identities WHERE email=? AND identity_type='human' AND is_active=1", (email,)).fetchone()
+    if not row:
+        c.close()
+        audit("recovery_issue_denied", detail=email)
+        raise HTTPException(403, "Identity is not eligible for administrator recovery")
+    admin = c.execute(
+        """SELECT 1 FROM identity_roles ir
+           JOIN roles r ON r.id=ir.role_id
+           WHERE ir.identity_id=? AND r.name IN ('platform-admin','security-admin')
+           LIMIT 1""",
+        (row["id"],),
+    ).fetchone()
+    if not admin:
+        c.close()
+        audit("recovery_issue_denied", target_id=row["id"], detail="not_admin")
+        raise HTTPException(403, "Identity is not eligible for administrator recovery")
+    code = "-".join([f"{secrets.randbelow(10000):04d}" for _ in range(3)])
+    c.execute("DELETE FROM recovery_codes WHERE identity_id=? AND used_at IS NULL", (row["id"],))
+    c.execute("INSERT INTO recovery_codes(code_hash,identity_id,expires_at,used_at,created_at) VALUES(?,?,?,NULL,?)",
+              (hash_token(code), row["id"], now() + 600, now()))
+    c.commit()
+    c.close()
+    audit("recovery_code_issued", actor_id="self-recovery", target_id=row["id"], detail="expires_in=600")
+    return {"email": email, "recovery_code": code, "expires_in": 600, "one_time_display": True}
+
+
+@app.post("/v1/auth/recovery/redeem")
+def redeem_recovery(body: RecoveryRedeemRequest):
+    email = body.email.strip().lower()
+    c = db()
+    row = c.execute("SELECT * FROM identities WHERE email=? AND identity_type='human'", (email,)).fetchone()
+    if not row:
+        c.close()
+        audit("recovery_failed", detail=email)
+        raise HTTPException(401, "Invalid or expired recovery code")
+    code_hash = hash_token(body.code.strip())
+    rec = c.execute(
+        "SELECT * FROM recovery_codes WHERE code_hash=? AND identity_id=? AND used_at IS NULL",
+        (code_hash, row["id"]),
+    ).fetchone()
+    if not rec or rec["expires_at"] <= now():
+        c.close()
+        audit("recovery_failed", target_id=row["id"], detail="invalid_or_expired")
+        raise HTTPException(401, "Invalid or expired recovery code")
+    try:
+        encoded = password_hash(body.new_password)
+    except ValueError as exc:
+        c.close()
+        raise HTTPException(400, str(exc))
+    c.execute("UPDATE identities SET password_hash=?,is_active=1,updated_at=? WHERE id=?",
+              (encoded, now(), row["id"]))
+    c.execute("UPDATE recovery_codes SET used_at=? WHERE code_hash=?", (now(), code_hash))
+    c.execute("DELETE FROM sessions WHERE identity_id=?", (row["id"],))
+    c.commit()
+    c.close()
+    audit("administrator_recovered", actor_id=row["id"], target_id=row["id"])
+    return {"recovered": True, "email": email, "sessions_revoked": True}
+
+
+def _sso_clients() -> dict[str, set[str]]:
+    raw = os.getenv("UNG_IAM_SSO_CLIENTS", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return {str(k): {str(u) for u in (v if isinstance(v, list) else [v])} for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def _validate_sso_client(client_id: str, redirect_uri: str):
+    allowed = _sso_clients().get(client_id, set())
+    if redirect_uri not in allowed:
+        raise HTTPException(400, "Unregistered SSO client or redirect URI")
+
+
+@app.post("/v1/sso/authorize")
+def sso_authorize(body: SsoAuthorizeRequest, me: dict = Depends(current_identity)):
+    _validate_sso_client(body.client_id, body.redirect_uri)
+    code = "sso_" + secrets.token_urlsafe(32)
+    c = db()
+    c.execute("DELETE FROM sso_codes WHERE expires_at<=? OR used_at IS NOT NULL", (now(),))
+    c.execute("INSERT INTO sso_codes(code_hash,identity_id,client_id,redirect_uri,expires_at,used_at,created_at) VALUES(?,?,?,?,?,NULL,?)",
+              (hash_token(code), me["id"], body.client_id, body.redirect_uri, now()+60, now()))
+    c.commit(); c.close()
+    audit("sso_code_issued", actor_id=me["id"], detail=body.client_id)
+    return {"code": code, "expires_in": 60}
+
+
+@app.post("/v1/sso/exchange")
+def sso_exchange(body: SsoExchangeRequest):
+    _validate_sso_client(body.client_id, body.redirect_uri)
+    c = db()
+    rec = c.execute("SELECT * FROM sso_codes WHERE code_hash=? AND client_id=? AND redirect_uri=? AND used_at IS NULL",
+                    (hash_token(body.code), body.client_id, body.redirect_uri)).fetchone()
+    if not rec or rec["expires_at"] <= now():
+        c.close(); raise HTTPException(401, "Invalid or expired SSO code")
+    row = c.execute("SELECT * FROM identities WHERE id=? AND is_active=1", (rec["identity_id"],)).fetchone()
+    if not row:
+        c.close(); raise HTTPException(401, "Identity unavailable")
+    c.execute("UPDATE sso_codes SET used_at=? WHERE code_hash=?", (now(), hash_token(body.code)))
+    raw = "iam_" + secrets.token_urlsafe(48); th = hash_token(raw)
+    c.execute("INSERT INTO sessions VALUES(?,?,?,?,?)", (th,row["id"],now()+SESSION_TTL,now(),now()))
+    who=payload(c,row); c.commit(); c.close()
+    audit("sso_exchange_success", actor_id=row["id"], detail=body.client_id)
+    return {"access_token":raw,"token_type":"bearer","expires_in":SESSION_TTL,"identity":who}
+
+
 @app.post("/v1/auth/login")
 def login(body: LoginRequest):
     email = body.email.strip().lower()
     c = db()
     row = c.execute("SELECT * FROM identities WHERE email=? AND identity_type='human'", (email,)).fetchone()
-    if not row or not row["is_active"] or not row["password_hash"] or not password_valid(body.password, row["password_hash"]):
+    shared_email = os.getenv("UNG_IAM_SHARED_ADMIN_EMAIL", "").strip().lower()
+    is_shared_admin = bool(shared_email and email == shared_email)
+    if row and not row["is_active"]:
+        c.close()
+        audit("login_failed", detail=email)
+        raise HTTPException(401, "Invalid credentials")
+    # A locally recovered password takes precedence. Shared-admin verification
+    # remains a fallback for the configured federated administrator.
+    local_password_ok = bool(row and row["password_hash"] and password_valid(body.password, row["password_hash"]))
+    if is_shared_admin and not local_password_ok:
+        from shared_admin import verify_master
+        try:
+            verify_master(os.getenv("UNG_IAM_SHARED_AUTH_URL", ""), body.password)
+            if not row:
+                iid = str(uuid.uuid4())
+                c.execute("INSERT OR IGNORE INTO identities VALUES(?,?,?,?,?,?,1,?,?)",
+                          (iid, "human", "corporate", "UNG Shared Administrator", email,
+                           password_hash(secrets.token_urlsafe(48)), now(), now()))
+                row = c.execute("SELECT * FROM identities WHERE email=? AND identity_type='human'", (email,)).fetchone()
+            if not row or not row["is_active"]:
+                raise HTTPException(401, "Invalid credentials")
+            rid = c.execute("SELECT id FROM roles WHERE name='platform-admin'").fetchone()
+            if not rid:
+                raise HTTPException(503, "Administrator role is not configured")
+            c.execute("INSERT OR IGNORE INTO identity_roles(identity_id,role_id) VALUES(?,?)", (row["id"], rid["id"]))
+        except Exception:
+            c.rollback()
+            c.close()
+            audit("shared_admin_login_failed", detail=email)
+            raise
+    elif not local_password_ok:
         c.close()
         audit("login_failed", detail=email)
         raise HTTPException(401, "Invalid credentials")
@@ -361,7 +716,120 @@ def login(body: LoginRequest):
     c.commit()
     c.close()
     audit("login_success", actor_id=row["id"])
-    return {"access_token": raw, "token_type": "bearer", "expires_in": SESSION_TTL, "identity": who}
+    response = JSONResponse({"access_token": raw, "token_type": "bearer", "expires_in": SESSION_TTL, "identity": who})
+    response.set_cookie("ung_iam_session", raw, max_age=SESSION_TTL, httponly=True, secure=True, samesite="lax")
+    return response
+
+
+@app.post("/v1/auth/mfa/enroll")
+def mfa_enroll(me: dict = Depends(current_identity)):
+    if me.get("identity_type") != "human":
+        raise HTTPException(400, "MFA enrollment is for human identities")
+    secret = base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+    c = db()
+    c.execute("DELETE FROM mfa_factors WHERE identity_id=?", (me["id"],))
+    c.execute(
+        "INSERT INTO mfa_factors(identity_id,secret,enabled,created_at,confirmed_at) VALUES(?,?,0,?,NULL)",
+        (me["id"], _mfa_secret_store(secret), now()),
+    )
+    c.commit()
+    c.close()
+    issuer = "UNG-IAM"
+    account = me.get("email") or me.get("display_name") or me["id"]
+    audit("mfa_enrollment_started", actor_id=me["id"], target_id=me["id"])
+    return {
+        "secret": secret,
+        "otpauth_uri": f"otpauth://totp/{issuer}:{account}?secret={secret}&issuer={issuer}&algorithm=SHA1&digits=6&period=30",
+        "warning": "The secret is shown for enrollment. Protect it and confirm with a generated code.",
+    }
+
+
+@app.post("/v1/auth/mfa/confirm")
+def mfa_confirm(body: MfaCodeRequest, me: dict = Depends(current_identity)):
+    c = db()
+    row = c.execute("SELECT * FROM mfa_factors WHERE identity_id=?", (me["id"],)).fetchone()
+    if not row or not _totp_valid(_mfa_secret_load(row["secret"]), body.code):
+        c.close()
+        audit("mfa_enrollment_failed", actor_id=me["id"], target_id=me["id"])
+        raise HTTPException(401, "Invalid MFA code")
+    if not str(row["secret"]).startswith("enc:v1:"):
+        c.execute("UPDATE mfa_factors SET secret=? WHERE identity_id=?", (_mfa_secret_store(_mfa_secret_load(row["secret"])), me["id"]))
+    c.execute("UPDATE mfa_factors SET enabled=1,confirmed_at=? WHERE identity_id=?", (now(), me["id"]))
+    c.commit()
+    c.close()
+    audit("mfa_enabled", actor_id=me["id"], target_id=me["id"])
+    return {"mfa_enabled": True}
+
+
+@app.post("/v1/auth/step-up")
+def mfa_step_up(body: MfaCodeRequest, authorization: str = Header(default="")):
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Bearer token required")
+    raw = authorization.split(" ", 1)[1].strip()
+    principal = resolve_principal(raw)
+    if not principal or principal.get("identity_type") != "human":
+        raise HTTPException(401, "Active human session required")
+    token_hash = hash_token(raw)
+    c = db()
+    session = c.execute("SELECT identity_id FROM sessions WHERE token_hash=? AND expires_at>?", (token_hash, now())).fetchone()
+    factor = c.execute("SELECT * FROM mfa_factors WHERE identity_id=? AND enabled=1", (principal["id"],)).fetchone()
+    if not session or not factor or not _totp_valid(_mfa_secret_load(factor["secret"]), body.code):
+        c.close()
+        audit("mfa_step_up_failed", actor_id=principal["id"], target_id=principal["id"])
+        raise HTTPException(401, "MFA step-up failed")
+    ts = now()
+    if not str(factor["secret"]).startswith("enc:v1:"):
+        c.execute("UPDATE mfa_factors SET secret=? WHERE identity_id=?", (_mfa_secret_store(_mfa_secret_load(factor["secret"])), principal["id"]))
+    c.execute("DELETE FROM session_mfa WHERE token_hash=?", (token_hash,))
+    c.execute("INSERT INTO session_mfa(token_hash,mfa_time) VALUES(?,?)", (token_hash, ts))
+    c.commit()
+    c.close()
+    audit("mfa_step_up_success", actor_id=principal["id"], target_id=principal["id"])
+    return {"mfa": True, "mfa_time": ts, "amr": ["pwd", "otp", "mfa"]}
+
+
+@app.post("/v1/auth/introspect")
+def introspect(authorization: str = Header(default="")):
+    if not authorization.lower().startswith("bearer "):
+        return {"active": False}
+    raw = authorization.split(" ", 1)[1].strip()
+    principal = resolve_principal(raw)
+    if not principal and raw.startswith("scif_"):
+        principal = resolve_scif_handle(raw)
+    if not principal:
+        return {"active": False}
+    return {"active": True, "principal": principal}
+
+
+@app.post("/v1/auth/scif-handle")
+def issue_scif_handle(authorization: str = Header(default="")):
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Bearer token required")
+    raw = authorization.split(" ", 1)[1].strip()
+    principal = resolve_principal(raw)
+    if not principal or principal.get("identity_type") != "human":
+        raise HTTPException(401, "Active human session required")
+    parent_hash = hash_token(raw)
+    c = db()
+    try:
+        mfa_row = c.execute("SELECT mfa_time FROM session_mfa WHERE token_hash=?", (parent_hash,)).fetchone()
+        if not mfa_row:
+            raise HTTPException(401, "Fresh MFA step-up required")
+        age = now() - float(mfa_row["mfa_time"])
+        if age < 0 or age > 300:
+            raise HTTPException(401, "Fresh MFA step-up required")
+        handle = "scif_" + secrets.token_urlsafe(48)
+        handle_hash = hash_token(handle)
+        c.execute("DELETE FROM scif_handles WHERE parent_token_hash=? OR expires_at<=?", (parent_hash, now()))
+        c.execute(
+            "INSERT INTO scif_handles(handle_hash,identity_id,parent_token_hash,expires_at,created_at) VALUES(?,?,?,?,?)",
+            (handle_hash, principal["id"], parent_hash, now()+SCIF_HANDLE_TTL, now()),
+        )
+        c.commit()
+    finally:
+        c.close()
+    audit("scif_handle_issued", actor_id=principal["id"], target_id=principal["id"])
+    return {"access_token": handle, "token_type": "bearer", "expires_in": SCIF_HANDLE_TTL}
 
 
 @app.post("/v1/auth/logout")
@@ -430,6 +898,48 @@ def create_identity(body: IdentityCreate, admin: dict = Depends(require("iam:wri
         raise HTTPException(409, "Identity email already exists")
     audit("identity_created", admin["id"], iid, body.access_class)
     return result
+
+
+@app.post("/v1/me/password")
+def change_my_password(body: PasswordChangeRequest, principal: dict = Depends(current_identity)):
+    c = db()
+    row = c.execute("SELECT * FROM identities WHERE id=? AND identity_type='human'", (principal["id"],)).fetchone()
+    if not row or not row["password_hash"] or not password_valid(body.current_password, row["password_hash"]):
+        c.close()
+        audit("password_change_failed", actor_id=principal["id"], target_id=principal["id"])
+        raise HTTPException(401, "Current password is incorrect")
+    try:
+        encoded = password_hash(body.new_password)
+    except ValueError as exc:
+        c.close()
+        raise HTTPException(400, str(exc))
+    c.execute("UPDATE identities SET password_hash=?,updated_at=? WHERE id=?", (encoded, now(), row["id"]))
+    c.execute("DELETE FROM sessions WHERE identity_id=?", (row["id"],))
+    c.commit()
+    c.close()
+    audit("password_changed", actor_id=principal["id"], target_id=principal["id"])
+    return {"changed": True, "sessions_revoked": True}
+
+
+@app.post("/v1/identities/{identity_id}/password")
+def admin_reset_password(identity_id: str, body: AdminPasswordResetRequest, admin: dict = Depends(require("iam:write"))):
+    c = db()
+    row = c.execute("SELECT * FROM identities WHERE id=? AND identity_type='human'", (identity_id,)).fetchone()
+    if not row:
+        c.close()
+        raise HTTPException(404, "Human identity not found")
+    try:
+        encoded = password_hash(body.new_password)
+    except ValueError as exc:
+        c.close()
+        raise HTTPException(400, str(exc))
+    c.execute("UPDATE identities SET password_hash=?,is_active=1,updated_at=? WHERE id=?",
+              (encoded, now(), identity_id))
+    c.execute("DELETE FROM sessions WHERE identity_id=?", (identity_id,))
+    c.commit()
+    c.close()
+    audit("administrator_password_reset", actor_id=admin["id"], target_id=identity_id)
+    return {"reset": True, "identity_id": identity_id, "sessions_revoked": True}
 
 
 @app.patch("/v1/identities/{identity_id}")
@@ -528,6 +1038,50 @@ def create_role(body: RoleCreate, admin: dict = Depends(require("iam:roles"))):
     c.close()
     audit("role_created", admin["id"], rid, body.name)
     return {"id": rid, "name": body.name, "permissions": body.permissions}
+
+
+@app.post("/v1/service-identities/bootstrap")
+def bootstrap_service_identity(
+    body: IdentityCreate,
+    admin: dict = Depends(require("iam:write")),
+):
+    """Idempotently create or repair a machine identity and its service role.
+
+    Credential material is intentionally not returned here; issue/rotate it with
+    the dedicated credentials endpoint so identity lifecycle and secret lifecycle
+    remain separately auditable.
+    """
+    if body.identity_type != "service" or body.access_class != "service":
+        raise HTTPException(400, "bootstrap requires identity_type=service and access_class=service")
+    name = body.display_name.strip()
+    c = db()
+    row = c.execute(
+        "SELECT * FROM identities WHERE identity_type='service' AND display_name=?", (name,)
+    ).fetchone()
+    created = False
+    if not row:
+        iid = str(uuid.uuid4())
+        c.execute(
+            "INSERT INTO identities VALUES(?,?,?,?,?,?,1,?,?)",
+            (iid, "service", "service", name, None, None, now(), now()),
+        )
+        row = c.execute("SELECT * FROM identities WHERE id=?", (iid,)).fetchone()
+        created = True
+    elif not row["is_active"] or row["access_class"] != "service":
+        c.execute(
+            "UPDATE identities SET access_class='service',is_active=1,updated_at=? WHERE id=?",
+            (now(), row["id"]),
+        )
+        row = c.execute("SELECT * FROM identities WHERE id=?", (row["id"],)).fetchone()
+    role = c.execute("SELECT id FROM roles WHERE name='service'").fetchone()
+    if not role:
+        c.close()
+        raise HTTPException(503, "service role is not configured")
+    c.execute("INSERT OR IGNORE INTO identity_roles(identity_id,role_id) VALUES(?,?)", (row["id"], role["id"]))
+    result = payload(c, c.execute("SELECT * FROM identities WHERE id=?", (row["id"],)).fetchone())
+    c.commit(); c.close()
+    audit("service_identity_bootstrapped", admin["id"], row["id"], name)
+    return {"created": created, "identity": result}
 
 
 @app.post("/v1/service-identities/{identity_id}/credentials")
